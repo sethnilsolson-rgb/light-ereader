@@ -80,6 +80,7 @@ class BookmarksScreen(
                 ReaderDatabase::class.java,
                 ReaderRepository.DATABASE_NAME,
             ) {
+                addMigrations(ReaderDatabase.MIGRATION_2_3)
                 fallbackToDestructiveMigration(true)
             }
         },
@@ -109,6 +110,7 @@ class BookmarksScreen(
                     bookId = bookmark.bookId,
                     bookFormat = format,
                     initialChapter = bookmark.positionIndex,
+                    initialScrollPermille = bookmark.scrollPermille,
                 )
             })
         }

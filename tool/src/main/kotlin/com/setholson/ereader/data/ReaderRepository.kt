@@ -335,6 +335,13 @@ class ReaderRepository(
         )
     }
 
+    fun getBookmarksForPosition(bookId: String, positionIndex: Int): Flow<List<BookBookmarkEntity>> =
+        database.bookmarkDao().getBookmarksForPosition(bookId, positionIndex)
+
+    suspend fun updateScrollProgress(bookId: String, scrollPermille: Int) = withContext(Dispatchers.IO) {
+        database.progressDao().updateScrollIndex(bookId, scrollPermille.coerceIn(0, 1000))
+    }
+
     suspend fun toggleBookmark(
         bookId: String,
         bookTitle: String,
@@ -343,6 +350,7 @@ class ReaderRepository(
         positionLabel: String,
         snippet: String,
         currentlyBookmarked: Boolean,
+        scrollPermille: Int = 0,
     ) = withContext(Dispatchers.IO) {
         if (currentlyBookmarked) {
             database.bookmarkDao().deletePositionBookmark(bookId, positionIndex)
@@ -354,7 +362,38 @@ class ReaderRepository(
                     format = format.name,
                     positionIndex = positionIndex,
                     positionLabel = positionLabel,
-                    snippet = snippet.take(100),
+                    snippet = snippet.take(120),
+                    scrollPermille = scrollPermille.coerceIn(0, 1000),
+                )
+            )
+        }
+    }
+
+    suspend fun toggleScrollBookmark(
+        bookId: String,
+        bookTitle: String,
+        format: BookFormat,
+        positionIndex: Int,
+        chapterTitle: String,
+        scrollPermille: Int,
+        snippet: String,
+        matchingBookmark: BookBookmarkEntity?,
+    ) = withContext(Dispatchers.IO) {
+        if (matchingBookmark != null) {
+            database.bookmarkDao().deleteBookmark(matchingBookmark)
+        } else {
+            val clamped = scrollPermille.coerceIn(0, 1000)
+            val pct = (clamped / 10).coerceIn(0, 100)
+            val label = if (pct > 0) "$chapterTitle • $pct% in" else chapterTitle
+            database.bookmarkDao().insertBookmark(
+                BookBookmarkEntity(
+                    bookId = bookId,
+                    bookTitle = bookTitle,
+                    format = format.name,
+                    positionIndex = positionIndex,
+                    positionLabel = label,
+                    snippet = snippet.take(120),
+                    scrollPermille = clamped,
                 )
             )
         }

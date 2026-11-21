@@ -21,6 +21,9 @@ interface BookProgressDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertProgress(progress: BookProgressEntity)
 
+    @Query("UPDATE book_progress SET scrollIndex = :scrollPermille, lastReadAt = :updatedAt WHERE bookId = :bookId")
+    suspend fun updateScrollIndex(bookId: String, scrollPermille: Int, updatedAt: Long = System.currentTimeMillis())
+
     @Query("DELETE FROM book_progress WHERE bookId = :bookId")
     suspend fun deleteProgress(bookId: String)
 }
@@ -32,6 +35,9 @@ interface BookBookmarkDao {
 
     @Query("SELECT COUNT(*) FROM book_bookmarks")
     fun getBookmarkCount(): Flow<Int>
+
+    @Query("SELECT * FROM book_bookmarks WHERE bookId = :bookId AND positionIndex = :positionIndex ORDER BY scrollPermille ASC")
+    fun getBookmarksForPosition(bookId: String, positionIndex: Int): Flow<List<BookBookmarkEntity>>
 
     @Query("SELECT EXISTS(SELECT 1 FROM book_bookmarks WHERE bookId = :bookId AND positionIndex = :positionIndex)")
     fun isPositionBookmarked(bookId: String, positionIndex: Int): Flow<Boolean>

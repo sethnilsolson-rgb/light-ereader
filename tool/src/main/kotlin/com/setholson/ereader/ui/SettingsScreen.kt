@@ -176,6 +176,7 @@ class SettingsScreen(
                 ReaderDatabase::class.java,
                 ReaderRepository.DATABASE_NAME,
             ) {
+                addMigrations(ReaderDatabase.MIGRATION_2_3)
                 fallbackToDestructiveMigration(true)
             }
         },

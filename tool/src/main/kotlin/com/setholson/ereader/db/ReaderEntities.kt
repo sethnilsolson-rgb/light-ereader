@@ -28,6 +28,7 @@ data class BookBookmarkEntity(
     val positionIndex: Int,
     val positionLabel: String,
     val snippet: String,
+    val scrollPermille: Int = 0,
     val createdAt: Long = System.currentTimeMillis(),
 )
 
