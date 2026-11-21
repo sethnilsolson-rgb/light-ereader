@@ -12,6 +12,7 @@ import com.setholson.ereader.model.FreeCatalogBook
 import com.setholson.ereader.model.LibraryBook
 import com.setholson.ereader.model.ParsedBook
 import com.setholson.ereader.model.ReaderFontSize
+import com.setholson.ereader.model.ReaderProgressMode
 import com.setholson.ereader.model.WordLookupResult
 import com.thelightphone.toolmanager.LightFileProvider
 import kotlinx.coroutines.Dispatchers
@@ -71,6 +72,14 @@ class ReaderRepository(
 
     suspend fun getFontSizeSync(): ReaderFontSize = withContext(Dispatchers.IO) {
         ReaderFontSize.fromName(database.settingDao().getSettingSync(KEY_FONT_SIZE))
+    }
+
+    suspend fun setProgressMode(mode: ReaderProgressMode) = withContext(Dispatchers.IO) {
+        database.settingDao().putSetting(ReaderSettingEntity(KEY_PROGRESS_MODE, mode.name))
+    }
+
+    suspend fun getProgressModeSync(): ReaderProgressMode = withContext(Dispatchers.IO) {
+        ReaderProgressMode.fromName(database.settingDao().getSettingSync(KEY_PROGRESS_MODE))
     }
 
     suspend fun setPdfDarkInvert(enabled: Boolean) = withContext(Dispatchers.IO) {
@@ -296,12 +305,35 @@ class ReaderRepository(
     suspend fun renderPdfPage(
         bookId: String,
         pageIndex: Int,
-        targetWidthPx: Int = 1080,
-    ): Result<Pair<Bitmap, Int>> = withContext(Dispatchers.IO) {
+        targetWidthPx: Int = 2160,
+    ): Result<RenderedPdfPage> = withContext(Dispatchers.IO) {
         val file = resolveBookFile(bookId) ?: return@withContext Result.failure(
             IllegalStateException("PDF file not found.")
         )
         PdfBookLoader.renderPage(file, pageIndex, targetWidthPx)
+    }
+
+    suspend fun renderPdfViewportTile(
+        bookId: String,
+        pageIndex: Int,
+        viewportWidthPx: Int,
+        viewportHeightPx: Int,
+        totalScale: Float,
+        translateX: Float,
+        translateY: Float,
+    ): Result<Bitmap> = withContext(Dispatchers.IO) {
+        val file = resolveBookFile(bookId) ?: return@withContext Result.failure(
+            IllegalStateException("PDF file not found.")
+        )
+        PdfBookLoader.renderViewportTile(
+            file = file,
+            pageIndex = pageIndex,
+            viewportWidthPx = viewportWidthPx,
+            viewportHeightPx = viewportHeightPx,
+            totalScale = totalScale,
+            translateX = translateX,
+            translateY = translateY,
+        )
     }
 
     suspend fun getProgressSync(bookId: String): BookProgressEntity? = withContext(Dispatchers.IO) {
@@ -418,6 +450,7 @@ class ReaderRepository(
     companion object {
         const val DATABASE_NAME = "light_ereader.db"
         private const val KEY_FONT_SIZE = "font_size"
+        private const val KEY_PROGRESS_MODE = "progress_mode"
         private const val KEY_PDF_DARK_INVERT = "pdf_dark_invert"
         private const val KEY_PRIMARY_DICT = "primary_dict"
         private const val KEY_ONLINE_DICT_ENABLED = "online_dict_enabled"

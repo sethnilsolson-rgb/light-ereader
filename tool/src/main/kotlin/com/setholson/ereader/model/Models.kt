@@ -31,6 +31,23 @@ enum class ReaderFontSize(val label: String, val displayLabel: String) {
     }
 }
 
+enum class ReaderProgressMode(val label: String) {
+    BOOK("Book %"),
+    CHAPTER("Chapter %"),
+    HIDDEN("Off");
+
+    fun next(): ReaderProgressMode = when (this) {
+        BOOK -> CHAPTER
+        CHAPTER -> HIDDEN
+        HIDDEN -> BOOK
+    }
+
+    companion object {
+        fun fromName(name: String?): ReaderProgressMode =
+            entries.firstOrNull { it.name.equals(name, ignoreCase = true) } ?: BOOK
+    }
+}
+
 enum class DictionaryPack(
     val id: String,
     val displayName: String,

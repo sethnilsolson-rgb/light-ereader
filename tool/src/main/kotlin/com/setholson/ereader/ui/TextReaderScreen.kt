@@ -54,6 +54,7 @@ import com.setholson.ereader.model.BookChapter
 import com.setholson.ereader.model.BookFormat
 import com.setholson.ereader.model.ParsedBook
 import com.setholson.ereader.model.ReaderFontSize
+import com.setholson.ereader.model.ReaderProgressMode
 import com.setholson.ereader.model.WordLookupResult
 import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
@@ -120,6 +121,9 @@ class TextReaderViewModel(
     private val _fontSize = MutableStateFlow(ReaderFontSize.REGULAR)
     val fontSize: StateFlow<ReaderFontSize> = _fontSize.asStateFlow()
 
+    private val _progressMode = MutableStateFlow(ReaderProgressMode.BOOK)
+    val progressMode: StateFlow<ReaderProgressMode> = _progressMode.asStateFlow()
+
     private val _lookupEnabled = MutableStateFlow(false)
     val lookupEnabled: StateFlow<Boolean> = _lookupEnabled.asStateFlow()
 
@@ -141,6 +145,7 @@ class TextReaderViewModel(
         super.onScreenShow(screen)
         viewModelScope.launch {
             _fontSize.value = repository.getFontSizeSync()
+            _progressMode.value = repository.getProgressModeSync()
             _lookupEnabled.value = repository.isAnyDictionaryReadySync()
         }
 
@@ -291,6 +296,14 @@ class TextReaderViewModel(
         }
     }
 
+    fun cycleProgressMode() {
+        val next = _progressMode.value.next()
+        _progressMode.value = next
+        viewModelScope.launch {
+            repository.setProgressMode(next)
+        }
+    }
+
     fun lookupWordAt(text: String, charIndex: Int) {
         if (!_lookupEnabled.value) return
         lookupJob?.cancel()
@@ -353,6 +366,7 @@ class TextReaderScreen(
         val errorText by viewModel.errorText.collectAsState()
         val chapterBookmarks by viewModel.chapterBookmarks.collectAsState()
         val fontSize by viewModel.fontSize.collectAsState()
+        val progressMode by viewModel.progressMode.collectAsState()
         val lookupEnabled by viewModel.lookupEnabled.collectAsState()
         val isLookingUp by viewModel.isLookingUp.collectAsState()
         val lookupResult by viewModel.lookupResult.collectAsState()
@@ -504,12 +518,32 @@ class TextReaderScreen(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         val progressText = if (totalChapters > 0) {
-                            val pct = (((chapterIndex + 1).toFloat() / totalChapters) * 100f).toInt().coerceIn(1, 100)
-                            val scrollPct = (currentScrollPermille / 10).coerceIn(0, 100)
-                            if (scrollState.maxValue > 0) {
-                                "Ch. ${chapterIndex + 1}/$totalChapters • $scrollPct% in ch."
-                            } else {
-                                "Ch. ${chapterIndex + 1} / $totalChapters • $pct%"
+                            when (progressMode) {
+                                ReaderProgressMode.BOOK -> {
+                                    val bookPct = (
+                                        ((chapterIndex.toFloat() + (currentScrollPermille / 1000f)) / totalChapters.toFloat()) * 100f
+                                        ).roundToInt().coerceIn(0, 100)
+                                    if (totalChapters > 1) {
+                                        "Ch. ${chapterIndex + 1}/$totalChapters • $bookPct% book"
+                                    } else {
+                                        "$bookPct% book"
+                                    }
+                                }
+                                ReaderProgressMode.CHAPTER -> {
+                                    val scrollPct = (currentScrollPermille / 10).coerceIn(0, 100)
+                                    if (totalChapters > 1) {
+                                        "Ch. ${chapterIndex + 1}/$totalChapters • $scrollPct% ch."
+                                    } else {
+                                        "$scrollPct% ch."
+                                    }
+                                }
+                                ReaderProgressMode.HIDDEN -> {
+                                    if (totalChapters > 1) {
+                                        "Ch. ${chapterIndex + 1}/$totalChapters"
+                                    } else {
+                                        "•••"
+                                    }
+                                }
                             }
                         } else {
                             book?.title.orEmpty()
@@ -520,7 +554,9 @@ class TextReaderScreen(
                             lighten = true,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.weight(1f),
+                            modifier = Modifier
+                                .weight(1f)
+                                .lightClickable { viewModel.cycleProgressMode() },
                         )
 
                         if (totalChapters > 1) {
