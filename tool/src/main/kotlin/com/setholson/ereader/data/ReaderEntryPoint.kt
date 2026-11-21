@@ -36,8 +36,12 @@ object ReaderEntryPoint : LightEntryPoint {
         )
     }
 
+    fun notifyLibraryChanged() {
+        _libraryRefreshSignal.value = System.currentTimeMillis()
+    }
+
     override suspend fun onToolManagerDataUpdate() {
         super.onToolManagerDataUpdate()
-        _libraryRefreshSignal.value = System.currentTimeMillis()
+        notifyLibraryChanged()
     }
 }

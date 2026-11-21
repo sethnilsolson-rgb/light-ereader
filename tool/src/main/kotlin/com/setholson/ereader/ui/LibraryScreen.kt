@@ -2,6 +2,7 @@ package com.setholson.ereader.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -68,7 +69,6 @@ class LibraryViewModel(
     val isScanning: StateFlow<Boolean> = _isScanning.asStateFlow()
 
     private val manualRefreshTrigger = MutableStateFlow(0L)
-    private var latestProgress: List<BookProgressEntity> = emptyList()
     private var scanJob: Job? = null
     private var bookmarkJob: Job? = null
 
@@ -89,7 +89,6 @@ class LibraryViewModel(
                 ReaderEntryPoint.libraryRefreshSignal,
                 manualRefreshTrigger,
             ) { progress, _, _ -> progress }.collect { progress ->
-                latestProgress = progress
                 rescan(progress)
             }
         }
@@ -154,6 +153,12 @@ class LibraryScreen(
         }
     }
 
+    private fun openAddBooks(tab: AddBooksTab) {
+        navigateTo(screenFactory = { act ->
+            AddBooksScreen(act, initialTab = tab)
+        })
+    }
+
     @Composable
     override fun Content() {
         val themeColors by LightThemeController.colors.collectAsState()
@@ -173,6 +178,11 @@ class LibraryScreen(
             ) {
                 Column(modifier = Modifier.fillMaxSize()) {
                     LightTopBar(
+                        leftButton = LightBarButton.LightIcon(
+                            icon = LightIcons.ADD,
+                            contentDescription = "Add Books",
+                            onClick = { openAddBooks(AddBooksTab.CLASSICS) },
+                        ),
                         center = LightTopBarCenter.Text("E-Reader"),
                         rightButton = LightBarButton.LightIcon(
                             icon = LightIcons.SETTINGS,
@@ -228,9 +238,8 @@ class LibraryScreen(
                                     maxLines = 2,
                                     overflow = TextOverflow.Ellipsis,
                                 )
-                                val progressLabel = formatBookProgress(recent)
                                 LightText(
-                                    text = progressLabel,
+                                    text = formatBookProgress(recent),
                                     variant = LightTextVariant.Detail,
                                     lighten = true,
                                     modifier = Modifier.padding(top = 3.dp),
@@ -238,11 +247,32 @@ class LibraryScreen(
                             }
                         }
 
-                        // 2. Bookmarks Quick Entry
+                        // 2. Quick Add Buttons (Free Classics & Wi-Fi Upload)
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(end = rightPad, top = 4.dp, bottom = 14.dp)
+                                .padding(end = rightPad, bottom = 14.dp),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            QuickActionTile(
+                                title = "Free Classics",
+                                subtitle = "19 free books",
+                                onClick = { openAddBooks(AddBooksTab.CLASSICS) },
+                                modifier = Modifier.weight(1f),
+                            )
+                            QuickActionTile(
+                                title = "Wi-Fi Upload",
+                                subtitle = "Send from PC/Mac",
+                                onClick = { openAddBooks(AddBooksTab.WIFI) },
+                                modifier = Modifier.weight(1f),
+                            )
+                        }
+
+                        // 3. Bookmarks Quick Entry
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(end = rightPad, top = 2.dp, bottom = 14.dp)
                                 .lightClickable {
                                     navigateTo(screenFactory = { act ->
                                         BookmarksScreen(act)
@@ -264,7 +294,7 @@ class LibraryScreen(
                             }
                         }
 
-                        // 3. User Library Section Header
+                        // 4. User Library Section Header
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -295,14 +325,15 @@ class LibraryScreen(
                                         color = LightThemeTokens.colors.content.copy(alpha = 0.35f),
                                         shape = RoundedCornerShape(4.dp),
                                     )
+                                    .lightClickable { openAddBooks(AddBooksTab.CLASSICS) }
                                     .padding(horizontal = 12.dp, vertical = 12.dp),
                             ) {
                                 LightText(
-                                    text = "No Books Uploaded Yet",
+                                    text = "No Books Yet",
                                     variant = LightTextVariant.Subheading,
                                 )
                                 LightText(
-                                    text = "Open Settings → Tool Manager on your Light Phone, visit the Tool Manager URL on your computer, and drop .epub, .pdf, .txt, or .md files into E-Reader → Books.",
+                                    text = "Tap Free Classics above to download 19 classic books right on your phone, or tap Wi-Fi Upload to drag-and-drop your own .epub, .pdf, .txt, or .md files from any computer.",
                                     variant = LightTextVariant.Detail,
                                     lighten = true,
                                     modifier = Modifier.padding(top = 4.dp),
@@ -319,7 +350,7 @@ class LibraryScreen(
                             Spacer(modifier = Modifier.height(10.dp))
                         }
 
-                        // 4. Built-in Quick Guide
+                        // 5. Built-in Quick Guide
                         guideBook?.let { guide ->
                             Spacer(modifier = Modifier.height(6.dp))
                             LightText(
@@ -340,6 +371,40 @@ class LibraryScreen(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun QuickActionTile(
+    title: String,
+    subtitle: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier
+            .border(
+                width = 1.dp,
+                color = LightThemeTokens.colors.content.copy(alpha = 0.45f),
+                shape = RoundedCornerShape(4.dp),
+            )
+            .lightClickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 9.dp),
+    ) {
+        LightText(
+            text = title,
+            variant = LightTextVariant.Subheading,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        LightText(
+            text = subtitle,
+            variant = LightTextVariant.Detail,
+            lighten = true,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(top = 2.dp),
+        )
     }
 }
 

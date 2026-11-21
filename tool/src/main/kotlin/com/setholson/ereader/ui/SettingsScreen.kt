@@ -2,6 +2,7 @@ package com.setholson.ereader.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -20,8 +21,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewModelScope
+import com.setholson.ereader.data.ReaderEntryPoint
 import com.setholson.ereader.data.ReaderRepository
 import com.setholson.ereader.db.ReaderDatabase
+import com.setholson.ereader.model.DictionaryPack
 import com.setholson.ereader.model.LibraryBook
 import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
@@ -45,6 +48,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 import java.text.NumberFormat
 import java.util.Locale
@@ -56,11 +60,17 @@ class SettingsViewModel(
     private val _pdfDarkInvert = MutableStateFlow(true)
     val pdfDarkInvert: StateFlow<Boolean> = _pdfDarkInvert.asStateFlow()
 
-    private val _dictCount = MutableStateFlow(0)
-    val dictCount: StateFlow<Int> = _dictCount.asStateFlow()
+    private val _dictCounts = MutableStateFlow<Map<String, Int>>(emptyMap())
+    val dictCounts: StateFlow<Map<String, Int>> = _dictCounts.asStateFlow()
 
-    private val _isDownloadingDict = MutableStateFlow(false)
-    val isDownloadingDict: StateFlow<Boolean> = _isDownloadingDict.asStateFlow()
+    private val _primaryDictId = MutableStateFlow<String?>(null)
+    val primaryDictId: StateFlow<String?> = _primaryDictId.asStateFlow()
+
+    private val _onlineDictEnabled = MutableStateFlow(false)
+    val onlineDictEnabled: StateFlow<Boolean> = _onlineDictEnabled.asStateFlow()
+
+    private val _downloadingPackId = MutableStateFlow<String?>(null)
+    val downloadingPackId: StateFlow<String?> = _downloadingPackId.asStateFlow()
 
     private val _dictProgress = MutableStateFlow<String?>(null)
     val dictProgress: StateFlow<String?> = _dictProgress.asStateFlow()
@@ -71,26 +81,39 @@ class SettingsViewModel(
     private val _userBooks = MutableStateFlow<List<LibraryBook>>(emptyList())
     val userBooks: StateFlow<List<LibraryBook>> = _userBooks.asStateFlow()
 
-    private var pdfSettingJob: Job? = null
-    private var dictSettingJob: Job? = null
+    private var settingsJob: Job? = null
+    private var countsJob: Job? = null
     private var booksJob: Job? = null
 
     override fun onScreenShow(screen: SimpleLightScreen<Unit>) {
         super.onScreenShow(screen)
 
-        pdfSettingJob?.cancel()
-        pdfSettingJob = viewModelScope.launch {
-            repository.pdfDarkInvertFlow.collect { _pdfDarkInvert.value = it }
+        settingsJob?.cancel()
+        settingsJob = viewModelScope.launch {
+            combine(
+                repository.pdfDarkInvertFlow,
+                repository.primaryDictIdFlow,
+                repository.onlineDictEnabledFlow,
+            ) { pdfInv, primaryId, onlineOn ->
+                Triple(pdfInv, primaryId, onlineOn)
+            }.collect { (pdfInv, primaryId, onlineOn) ->
+                _pdfDarkInvert.value = pdfInv
+                _primaryDictId.value = primaryId
+                _onlineDictEnabled.value = onlineOn
+            }
         }
 
-        dictSettingJob?.cancel()
-        dictSettingJob = viewModelScope.launch {
-            repository.dictEntryCountFlow.collect { _dictCount.value = it }
+        countsJob?.cancel()
+        countsJob = viewModelScope.launch {
+            repository.dictCountsFlow.collect { _dictCounts.value = it }
         }
 
         booksJob?.cancel()
         booksJob = viewModelScope.launch {
-            repository.allProgress.collect { progress ->
+            combine(
+                repository.allProgress,
+                ReaderEntryPoint.libraryRefreshSignal,
+            ) { progress, _ -> progress }.collect { progress ->
                 _userBooks.value = repository.scanLibrary(progress).filter { !it.isBuiltIn }
             }
         }
@@ -104,28 +127,34 @@ class SettingsViewModel(
         }
     }
 
-    fun downloadDictionary() {
-        if (_isDownloadingDict.value) return
+    fun downloadPack(pack: DictionaryPack) {
+        if (_downloadingPackId.value != null) return
         viewModelScope.launch {
-            _isDownloadingDict.value = true
+            _downloadingPackId.value = pack.id
             _errorText.value = null
             _dictProgress.value = "Connecting..."
-            val result = repository.downloadOfflineDictionary { msg ->
+            val result = repository.downloadDictionaryPack(pack) { msg ->
                 _dictProgress.value = msg
             }
             result.onFailure {
-                _errorText.value = "Couldn't download dictionary. Check Wi-Fi and try again."
+                _errorText.value = "Couldn't download ${pack.displayName}. Check Wi-Fi and try again."
             }
-            _isDownloadingDict.value = false
+            _downloadingPackId.value = null
             _dictProgress.value = null
         }
     }
 
-    fun removeDictionary() {
-        if (_isDownloadingDict.value) return
+    fun removePack(pack: DictionaryPack) {
+        if (_downloadingPackId.value != null) return
         viewModelScope.launch {
             _errorText.value = null
-            repository.removeOfflineDictionary()
+            repository.removeDictionaryPack(pack)
+        }
+    }
+
+    fun setPrimary(pack: DictionaryPack) {
+        viewModelScope.launch {
+            repository.setPrimaryDictionary(pack)
         }
     }
 
@@ -162,8 +191,10 @@ class SettingsScreen(
     override fun Content() {
         val themeColors by LightThemeController.colors.collectAsState()
         val pdfDarkInvert by viewModel.pdfDarkInvert.collectAsState()
-        val dictCount by viewModel.dictCount.collectAsState()
-        val isDownloadingDict by viewModel.isDownloadingDict.collectAsState()
+        val dictCounts by viewModel.dictCounts.collectAsState()
+        val primaryDictId by viewModel.primaryDictId.collectAsState()
+        val onlineDictEnabled by viewModel.onlineDictEnabled.collectAsState()
+        val downloadingPackId by viewModel.downloadingPackId.collectAsState()
         val dictProgress by viewModel.dictProgress.collectAsState()
         val errorText by viewModel.errorText.collectAsState()
         val userBooks by viewModel.userBooks.collectAsState()
@@ -285,14 +316,117 @@ class SettingsScreen(
                             )
                         }
 
-                        // 2. OFFLINE DICTIONARY
+                        // 2. PRESS-AND-HOLD DICTIONARIES (Multiple Downloadable Packs)
                         LightText(
-                            text = "PRESS-AND-HOLD DICTIONARY",
+                            text = "PRESS-AND-HOLD DICTIONARIES",
                             variant = LightTextVariant.Detail,
                             lighten = true,
-                            modifier = Modifier.padding(bottom = 8.dp),
+                            modifier = Modifier.padding(bottom = 4.dp),
+                        )
+                        LightText(
+                            text = "Download one or more dictionaries. Press and hold any word while reading EPUB/TXT books to look it up.",
+                            variant = LightTextVariant.Detail,
+                            lighten = true,
+                            modifier = Modifier.padding(end = rightPad, bottom = 10.dp),
                         )
 
+                        DictionaryPack.entries.forEach { pack ->
+                            val count = dictCounts[pack.id] ?: 0
+                            val isInstalled = if (pack.isOnlineAutoCache) onlineDictEnabled else count > 0
+                            val isPrimary = isInstalled && primaryDictId == pack.id
+                            val isDownloading = downloadingPackId == pack.id
+                            val busyOther = downloadingPackId != null && !isDownloading
+
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(end = rightPad, bottom = 10.dp)
+                                    .border(
+                                        width = if (isPrimary) 1.5.dp else 1.dp,
+                                        color = LightThemeTokens.colors.content.copy(alpha = if (isPrimary) 0.9f else 0.35f),
+                                        shape = RoundedCornerShape(4.dp),
+                                    )
+                                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        val titleText = if (isPrimary) "${pack.displayName} ★" else pack.displayName
+                                        LightText(
+                                            text = titleText,
+                                            variant = LightTextVariant.Subheading,
+                                            maxLines = 2,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                        val statusText = when {
+                                            isDownloading -> dictProgress ?: "Downloading..."
+                                            pack.isOnlineAutoCache && isInstalled -> {
+                                                val cachedStr = NumberFormat.getNumberInstance(Locale.US).format(count)
+                                                "Enabled • $cachedStr words cached offline"
+                                            }
+                                            isInstalled -> {
+                                                val formatted = NumberFormat.getNumberInstance(Locale.US).format(count)
+                                                "Installed • $formatted entries" + if (isPrimary) " • Default" else ""
+                                            }
+                                            else -> "${pack.sizeHint} • ${pack.description}"
+                                        }
+                                        LightText(
+                                            text = statusText,
+                                            variant = LightTextVariant.Detail,
+                                            lighten = !isDownloading,
+                                            modifier = Modifier.padding(top = 3.dp),
+                                        )
+                                    }
+                                }
+
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    when {
+                                        isDownloading -> {
+                                            SettingsPill("Downloading...", highlighted = false, onClick = {})
+                                        }
+                                        isInstalled -> {
+                                            if (!isPrimary) {
+                                                SettingsPill("Set Default", highlighted = true) {
+                                                    viewModel.setPrimary(pack)
+                                                }
+                                            } else {
+                                                SettingsPill("Default", highlighted = true, onClick = {})
+                                            }
+                                            SettingsPill(
+                                                label = if (pack.isOnlineAutoCache) "Turn Off" else "Remove",
+                                                highlighted = false,
+                                            ) { viewModel.removePack(pack) }
+                                        }
+                                        busyOther -> {
+                                            SettingsPill("Please wait...", highlighted = false, onClick = {})
+                                        }
+                                        else -> {
+                                            SettingsPill(
+                                                label = if (pack.isOnlineAutoCache) "Enable" else "Download",
+                                                highlighted = pack == DictionaryPack.MODERN_WORDSET,
+                                            ) { viewModel.downloadPack(pack) }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        // 3. ADDING BOOKS
+                        LightText(
+                            text = "ADDING BOOKS",
+                            variant = LightTextVariant.Detail,
+                            lighten = true,
+                            modifier = Modifier.padding(bottom = 6.dp),
+                        )
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -302,63 +436,35 @@ class SettingsScreen(
                                     color = LightThemeTokens.colors.content.copy(alpha = 0.4f),
                                     shape = RoundedCornerShape(4.dp),
                                 )
-                                .padding(horizontal = 12.dp, vertical = 12.dp),
+                                .lightClickable {
+                                    navigateTo(screenFactory = { act ->
+                                        AddBooksScreen(act, initialTab = AddBooksTab.WIFI)
+                                    })
+                                }
+                                .padding(horizontal = 12.dp, vertical = 10.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
                                 LightText(
-                                    text = "Webster's 1828 Dictionary",
+                                    text = "Add Books & Wi-Fi Transfer",
                                     variant = LightTextVariant.Subheading,
                                 )
-                                val sub = when {
-                                    isDownloadingDict -> dictProgress ?: "Downloading..."
-                                    dictCount > 0 -> {
-                                        val formatted = NumberFormat.getNumberInstance(Locale.US).format(dictCount)
-                                        "Ready • $formatted words • Hold any word in EPUB/TXT"
-                                    }
-                                    else -> "Optional offline dictionary for press-and-hold definitions."
-                                }
                                 LightText(
-                                    text = sub,
+                                    text = "Download 19 free classics, drag-and-drop over Wi-Fi, or paste a link.",
                                     variant = LightTextVariant.Detail,
-                                    lighten = !isDownloadingDict,
-                                    modifier = Modifier.padding(top = 3.dp),
+                                    lighten = true,
+                                    modifier = Modifier.padding(top = 2.dp),
                                 )
                             }
                             Spacer(modifier = Modifier.width(8.dp))
-                            when {
-                                isDownloadingDict -> SettingsPill("...", false, onClick = {})
-                                dictCount > 0 -> SettingsPill("Remove", false) { viewModel.removeDictionary() }
-                                else -> SettingsPill("Download", true) { viewModel.downloadDictionary() }
+                            SettingsPill("Open", highlighted = false) {
+                                navigateTo(screenFactory = { act ->
+                                    AddBooksScreen(act, initialTab = AddBooksTab.WIFI)
+                                })
                             }
                         }
 
-                        // 3. HOW TO UPLOAD BOOKS
-                        LightText(
-                            text = "ADDING BOOKS",
-                            variant = LightTextVariant.Detail,
-                            lighten = true,
-                            modifier = Modifier.padding(bottom = 6.dp),
-                        )
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(end = rightPad, bottom = 18.dp)
-                                .border(
-                                    width = 1.dp,
-                                    color = LightThemeTokens.colors.content.copy(alpha = 0.35f),
-                                    shape = RoundedCornerShape(4.dp),
-                                )
-                                .padding(horizontal = 12.dp, vertical = 10.dp),
-                        ) {
-                            LightText(
-                                text = "1. Open Settings → Tool Manager on your Light Phone.\n2. Open the Tool Manager URL in your computer's browser.\n3. Select E-Reader → Books and upload .epub, .pdf, .txt, or .md files.",
-                                variant = LightTextVariant.Detail,
-                                lighten = true,
-                            )
-                        }
-
-                        // 4. MANAGE UPLOADED BOOKS
+                        // 4. MANAGE BOOKS
                         if (userBooks.isNotEmpty()) {
                             LightText(
                                 text = "MANAGE BOOKS (${userBooks.size})",

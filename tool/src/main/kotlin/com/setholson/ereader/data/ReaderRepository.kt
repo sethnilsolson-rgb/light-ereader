@@ -7,6 +7,8 @@ import com.setholson.ereader.db.ReaderDatabase
 import com.setholson.ereader.db.ReaderSettingEntity
 import com.setholson.ereader.model.BookFormat
 import com.setholson.ereader.model.BookMetadata
+import com.setholson.ereader.model.DictionaryPack
+import com.setholson.ereader.model.FreeCatalogBook
 import com.setholson.ereader.model.LibraryBook
 import com.setholson.ereader.model.ParsedBook
 import com.setholson.ereader.model.ReaderFontSize
@@ -23,14 +25,12 @@ class ReaderRepository(
     private val database: ReaderDatabase,
     private val appFilesDir: File,
 ) {
-    private val booksRootDir: File
+    val booksRootDir: File
         get() = File(File(appFilesDir, LightFileProvider.SHARED_DIR), ReaderEntryPoint.BOOKS_RELATIVE_DIR).apply {
             if (!exists()) mkdirs()
         }
 
-    // Metadata cache keyed by "bookId|lastModified" to keep library scanning instantaneous
     private val metadataCache = ConcurrentHashMap<String, BookMetadata>()
-    // Parsed book cache keyed by "bookId|lastModified" for instant chapter/TOC navigation
     private val parsedBookCache = ConcurrentHashMap<String, ParsedBook>()
 
     val bookmarks: Flow<List<BookBookmarkEntity>> = database.bookmarkDao().getAllBookmarks()
@@ -50,8 +50,16 @@ class ReaderRepository(
         map[KEY_PDF_DARK_INVERT]?.toBooleanStrictOrNull() ?: true
     }
 
-    val dictEntryCountFlow: Flow<Int> = settingsMap.map { map ->
-        map[KEY_DICT_COUNT]?.toIntOrNull() ?: 0
+    val primaryDictIdFlow: Flow<String?> = settingsMap.map { map ->
+        map[KEY_PRIMARY_DICT]?.takeIf { it.isNotBlank() }
+    }
+
+    val onlineDictEnabledFlow: Flow<Boolean> = settingsMap.map { map ->
+        map[KEY_ONLINE_DICT_ENABLED]?.toBooleanStrictOrNull() ?: false
+    }
+
+    val dictCountsFlow: Flow<Map<String, Int>> = database.dictDao().getCountsByDict().map { rows ->
+        rows.associate { it.dictId to it.entryCount }
     }
 
     fun isPositionBookmarked(bookId: String, positionIndex: Int): Flow<Boolean> =
@@ -73,35 +81,122 @@ class ReaderRepository(
         database.settingDao().getSettingSync(KEY_PDF_DARK_INVERT)?.toBooleanStrictOrNull() ?: true
     }
 
-    suspend fun isDictionaryReadySync(): Boolean = withContext(Dispatchers.IO) {
-        val count = database.settingDao().getSettingSync(KEY_DICT_COUNT)?.toIntOrNull() ?: 0
-        count > 0 || database.dictDao().countEntries() > 100
+    suspend fun setPrimaryDictionary(pack: DictionaryPack) = withContext(Dispatchers.IO) {
+        database.settingDao().putSetting(ReaderSettingEntity(KEY_PRIMARY_DICT, pack.id))
     }
 
-    suspend fun downloadOfflineDictionary(onProgress: (String) -> Unit): Result<Int> =
-        withContext(Dispatchers.IO) {
-            val result = OfflineDictionaryService.downloadDictionary(database.dictDao(), onProgress)
-            result.onSuccess { count ->
-                database.settingDao().putSetting(ReaderSettingEntity(KEY_DICT_COUNT, count.toString()))
-            }
-            result
+    suspend fun setOnlineDictionaryEnabled(enabled: Boolean) = withContext(Dispatchers.IO) {
+        database.settingDao().putSetting(ReaderSettingEntity(KEY_ONLINE_DICT_ENABLED, enabled.toString()))
+        val currentPrimary = database.settingDao().getSettingSync(KEY_PRIMARY_DICT)
+        if (enabled && currentPrimary.isNullOrBlank()) {
+            database.settingDao().putSetting(ReaderSettingEntity(KEY_PRIMARY_DICT, DictionaryPack.ONLINE_MODERN.id))
+        } else if (!enabled && currentPrimary == DictionaryPack.ONLINE_MODERN.id) {
+            pickFallbackPrimaryDict()
         }
+    }
 
-    suspend fun removeOfflineDictionary() = withContext(Dispatchers.IO) {
-        database.dictDao().clearAll()
-        database.settingDao().putSetting(ReaderSettingEntity(KEY_DICT_COUNT, "0"))
+    suspend fun isAnyDictionaryReadySync(): Boolean = withContext(Dispatchers.IO) {
+        val online = database.settingDao().getSettingSync(KEY_ONLINE_DICT_ENABLED)?.toBooleanStrictOrNull() ?: false
+        if (online) return@withContext true
+        database.dictDao().countAll() > 0
+    }
+
+    suspend fun downloadDictionaryPack(
+        pack: DictionaryPack,
+        onProgress: (String) -> Unit,
+    ): Result<Int> = withContext(Dispatchers.IO) {
+        if (pack.isOnlineAutoCache) {
+            setOnlineDictionaryEnabled(true)
+            onProgress("Live Modern Dictionary enabled")
+            return@withContext Result.success(database.dictDao().countForDict(pack.id))
+        }
+        val result = OfflineDictionaryService.downloadPack(pack, database.dictDao(), onProgress)
+        result.onSuccess { count ->
+            if (count > 0) {
+                val currentPrimary = database.settingDao().getSettingSync(KEY_PRIMARY_DICT)
+                if (currentPrimary.isNullOrBlank()) {
+                    database.settingDao().putSetting(ReaderSettingEntity(KEY_PRIMARY_DICT, pack.id))
+                }
+            }
+        }
+        result
+    }
+
+    suspend fun removeDictionaryPack(pack: DictionaryPack) = withContext(Dispatchers.IO) {
+        if (pack.isOnlineAutoCache) {
+            setOnlineDictionaryEnabled(false)
+        }
+        database.dictDao().deleteByDict(pack.id)
+        val currentPrimary = database.settingDao().getSettingSync(KEY_PRIMARY_DICT)
+        if (currentPrimary == pack.id) {
+            pickFallbackPrimaryDict()
+        }
+    }
+
+    private suspend fun pickFallbackPrimaryDict() {
+        val counts = database.dictDao().getCountsByDictSync()
+        val firstInstalled = DictionaryPack.entries.firstOrNull { pack ->
+            !pack.isOnlineAutoCache && (counts.firstOrNull { it.dictId == pack.id }?.entryCount ?: 0) > 0
+        }
+        val online = database.settingDao().getSettingSync(KEY_ONLINE_DICT_ENABLED)?.toBooleanStrictOrNull() ?: false
+        val nextId = firstInstalled?.id ?: if (online) DictionaryPack.ONLINE_MODERN.id else ""
+        database.settingDao().putSetting(ReaderSettingEntity(KEY_PRIMARY_DICT, nextId))
     }
 
     suspend fun lookupWord(text: String, charIndex: Int): WordLookupResult? = withContext(Dispatchers.IO) {
-        if (!isDictionaryReadySync()) return@withContext null
-        OfflineDictionaryService.lookupAtOffset(text, charIndex, database.dictDao())
+        if (!isAnyDictionaryReadySync()) return@withContext null
+        val primaryId = database.settingDao().getSettingSync(KEY_PRIMARY_DICT)
+        val onlineEnabled = database.settingDao().getSettingSync(KEY_ONLINE_DICT_ENABLED)?.toBooleanStrictOrNull() ?: false
+        OfflineDictionaryService.lookupAtOffset(
+            text = text,
+            charIndex = charIndex,
+            dao = database.dictDao(),
+            primaryDictId = primaryId,
+            onlineEnabled = onlineEnabled,
+        )
     }
 
-    /**
-     * Scans the Tool Manager shared books folder for all supported books (.epub, .pdf, .txt, .md),
-     * merges saved reading progress, and includes the built-in Quick Guide so new users always
-     * have instructions and a sample book ready on first launch.
-     */
+    // -------------------------------------------------------------------------
+    // Free Classics Catalog & Direct URL Download
+    // -------------------------------------------------------------------------
+    fun isCatalogBookDownloaded(book: FreeCatalogBook): Boolean =
+        File(booksRootDir, book.fileName).isFile
+
+    suspend fun downloadCatalogBook(
+        book: FreeCatalogBook,
+        onProgress: (String) -> Unit,
+    ): Result<File> = withContext(Dispatchers.IO) {
+        val result = FreeBooksCatalog.downloadBookToDir(
+            urlString = book.downloadUrl,
+            targetDir = booksRootDir,
+            suggestedFileName = book.fileName,
+            onProgress = onProgress,
+        )
+        result.onSuccess {
+            ReaderEntryPoint.notifyLibraryChanged()
+        }
+        result
+    }
+
+    suspend fun downloadBookFromUrl(
+        url: String,
+        onProgress: (String) -> Unit,
+    ): Result<File> = withContext(Dispatchers.IO) {
+        val result = FreeBooksCatalog.downloadBookToDir(
+            urlString = url,
+            targetDir = booksRootDir,
+            suggestedFileName = null,
+            onProgress = onProgress,
+        )
+        result.onSuccess {
+            ReaderEntryPoint.notifyLibraryChanged()
+        }
+        result
+    }
+
+    // -------------------------------------------------------------------------
+    // Library Scanning, Reading & Bookmarks
+    // -------------------------------------------------------------------------
     suspend fun scanLibrary(progressList: List<BookProgressEntity>): List<LibraryBook> =
         withContext(Dispatchers.IO) {
             val progressById = progressList.associateBy { it.bookId }
@@ -181,7 +276,7 @@ class ReaderRepository(
             return@withContext Result.success(TextBookParser.welcomeGuideBook())
         }
         val file = resolveBookFile(bookId) ?: return@withContext Result.failure(
-            IllegalStateException("Book file not found. It may have been removed in Tool Manager.")
+            IllegalStateException("Book file not found. It may have been deleted.")
         )
         val cacheKey = "$bookId|${file.lastModified()}"
         parsedBookCache[cacheKey]?.let { return@withContext Result.success(it) }
@@ -192,7 +287,6 @@ class ReaderRepository(
             else -> Result.failure(IllegalArgumentException("Unsupported text book format: ${file.extension}"))
         }
         parsed.onSuccess { book ->
-            // Keep cache bounded to 4 recently opened books
             if (parsedBookCache.size >= 4) parsedBookCache.clear()
             parsedBookCache[cacheKey] = book
         }
@@ -278,6 +372,7 @@ class ReaderRepository(
         database.bookmarkDao().deleteAllForBook(bookId)
         metadataCache.keys.filter { it.startsWith("$bookId|") }.forEach { metadataCache.remove(it) }
         parsedBookCache.keys.filter { it.startsWith("$bookId|") }.forEach { parsedBookCache.remove(it) }
+        if (deleted) ReaderEntryPoint.notifyLibraryChanged()
         deleted
     }
 
@@ -285,7 +380,8 @@ class ReaderRepository(
         const val DATABASE_NAME = "light_ereader.db"
         private const val KEY_FONT_SIZE = "font_size"
         private const val KEY_PDF_DARK_INVERT = "pdf_dark_invert"
-        private const val KEY_DICT_COUNT = "dict_count"
+        private const val KEY_PRIMARY_DICT = "primary_dict"
+        private const val KEY_ONLINE_DICT_ENABLED = "online_dict_enabled"
 
         @Volatile
         private var instance: ReaderRepository? = null

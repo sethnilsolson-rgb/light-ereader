@@ -33,11 +33,15 @@ data class BookBookmarkEntity(
 
 @Entity(
     tableName = "dict_entries",
-    indices = [Index(value = ["headword"])],
+    indices = [
+        Index(value = ["dictId", "headword"]),
+        Index(value = ["headword"]),
+    ],
 )
 data class DictEntryEntity(
     @PrimaryKey(autoGenerate = true)
     val id: Long = 0,
+    val dictId: String,
     val headword: String,
     val definition: String,
 )
@@ -47,4 +51,9 @@ data class ReaderSettingEntity(
     @PrimaryKey
     val key: String,
     val value: String,
+)
+
+data class DictCountRow(
+    val dictId: String,
+    val entryCount: Int,
 )

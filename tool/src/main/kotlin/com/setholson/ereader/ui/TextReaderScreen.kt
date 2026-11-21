@@ -4,6 +4,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -23,6 +25,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -111,7 +114,7 @@ class TextReaderViewModel(
         super.onScreenShow(screen)
         viewModelScope.launch {
             _fontSize.value = repository.getFontSizeSync()
-            _lookupEnabled.value = repository.isDictionaryReadySync()
+            _lookupEnabled.value = repository.isAnyDictionaryReadySync()
         }
 
         if (!hasInitialized) {
@@ -333,7 +336,6 @@ class TextReaderScreen(
                         modifier = Modifier.padding(bottom = 0.5f.gridUnitsAsDp()),
                     )
 
-                    // Sub-header: Book progress + Table of Contents button + Font Size toggle
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -404,7 +406,6 @@ class TextReaderScreen(
                         )
                     }
 
-                    // Body Area
                     Box(
                         modifier = Modifier
                             .weight(1f)
@@ -430,7 +431,6 @@ class TextReaderScreen(
                                 }
                             }
                             currentChapter != null -> {
-                                // Keyed scroll view per chapter so switching chapters starts cleanly at the top
                                 androidx.compose.runtime.key(chapterIndex) {
                                     LightScrollView(
                                         modifier = Modifier
@@ -495,7 +495,6 @@ class TextReaderScreen(
                                             }
                                         }
 
-                                        // Chapter Footer Navigation
                                         Spacer(modifier = Modifier.height(18.dp))
                                         Row(
                                             modifier = Modifier
@@ -532,7 +531,7 @@ class TextReaderScreen(
                     }
                 }
 
-                // Press-and-Hold Offline Dictionary Card
+                // Multi-Dictionary Press-and-Hold Overlay Card
                 if (isOverlayOpen) {
                     Box(
                         modifier = Modifier
@@ -625,12 +624,14 @@ private fun DictionaryOverlayCard(
     modifier: Modifier = Modifier,
 ) {
     val colors = LightThemeTokens.colors
+    var selectedHitIdx by remember(result) { mutableIntStateOf(0) }
+
     Column(
         modifier = modifier
             .background(colors.background, RoundedCornerShape(6.dp))
             .border(width = 1.5.dp, color = colors.content, shape = RoundedCornerShape(6.dp))
             .padding(horizontal = 14.dp, vertical = 12.dp)
-            .heightIn(max = 300.dp),
+            .heightIn(max = 330.dp),
     ) {
         if (isLookingUp || result == null) {
             Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -644,10 +645,16 @@ private fun DictionaryOverlayCard(
             return@Column
         }
 
+        val hits = result.hits
+        val activeHit = hits.getOrNull(selectedHitIdx)
+        val displayHeadword = activeHit?.headword ?: result.headword
+        val displaySource = activeHit?.sourceLabel ?: result.sourceLabel
+        val displayDef = activeHit?.definition ?: result.definition
+
         Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Column(modifier = Modifier.weight(1f)) {
-                LightText(text = result.headword, variant = LightTextVariant.Subheading)
-                LightText(text = result.sourceLabel, variant = LightTextVariant.Detail, lighten = true)
+                LightText(text = displayHeadword, variant = LightTextVariant.Subheading)
+                LightText(text = displaySource, variant = LightTextVariant.Detail, lighten = true)
             }
             LightText(
                 text = "✕",
@@ -656,6 +663,41 @@ private fun DictionaryOverlayCard(
                     .padding(start = 12.dp)
                     .lightClickable { onDismiss() },
             )
+        }
+
+        // If multiple installed dictionaries defined this word, let the user switch between them
+        if (hits.size > 1) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 8.dp)
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                hits.forEachIndexed { idx, hit ->
+                    val active = idx == selectedHitIdx
+                    Box(
+                        modifier = Modifier
+                            .background(
+                                if (active) colors.content else colors.background,
+                                RoundedCornerShape(4.dp),
+                            )
+                            .border(
+                                width = 1.dp,
+                                color = colors.content.copy(alpha = if (active) 1f else 0.45f),
+                                shape = RoundedCornerShape(4.dp),
+                            )
+                            .lightClickable { selectedHitIdx = idx }
+                            .padding(horizontal = 8.dp, vertical = 3.dp),
+                    ) {
+                        LightText(
+                            text = hit.shortLabel,
+                            variant = LightTextVariant.Detail,
+                            color = if (active) colors.background else colors.content,
+                        )
+                    }
+                }
+            }
         }
 
         HorizontalDivider(
@@ -669,7 +711,7 @@ private fun DictionaryOverlayCard(
                 .fillMaxWidth()
                 .verticalScroll(rememberScrollState()),
         ) {
-            LightText(text = result.definition, variant = LightTextVariant.Paragraph)
+            LightText(text = displayDef, variant = LightTextVariant.Paragraph)
         }
     }
 }

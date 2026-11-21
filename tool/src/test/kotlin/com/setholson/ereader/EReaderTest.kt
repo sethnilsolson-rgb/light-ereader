@@ -1,11 +1,17 @@
 package com.setholson.ereader
 
 import com.setholson.ereader.data.EpubParser
+import com.setholson.ereader.data.FreeBooksCatalog
 import com.setholson.ereader.data.OfflineDictionaryService
 import com.setholson.ereader.data.TextBookParser
+import com.setholson.ereader.data.WifiBookServer
 import com.setholson.ereader.model.BookFormat
+import com.setholson.ereader.model.DictionaryPack
 import com.setholson.ereader.model.ReaderFontSize
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.URI
+import java.nio.file.Files
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import kotlin.test.Test
@@ -157,7 +163,6 @@ class EReaderTest {
         assertTrue(parsedMd.chapters[0].blocks.any { it.text == "It was a clear morning." })
         assertEquals("Chapter 1", parsedMd.chapters[1].title)
 
-        // Plain text with classic CHAPTER headings
         val plain = """
             CHAPTER I
 
@@ -172,27 +177,139 @@ class EReaderTest {
         assertEquals("CHAPTER I", parsedPlain.chapters[0].title)
         assertEquals("CHAPTER II", parsedPlain.chapters[1].title)
 
-        // Built-in Welcome Guide is complete
         val guide = TextBookParser.welcomeGuideBook()
         assertEquals(3, guide.chapters.size)
         assertTrue(guide.chapters.all { it.blocks.isNotEmpty() })
     }
 
     @Test
-    fun dictionaryCsvParsingAndEnglishStemming() {
-        val row = "\"PERSEVERANCE\",\"Persistence in any thing undertaken; continued pursuit or prosecution of any business.\""
-        val entry = OfflineDictionaryService.parseCsvRow(row)
-        assertNotNull(entry)
-        assertEquals("perseverance", entry.headword)
-        assertTrue(entry.definition.contains("Persistence"))
+    fun multiDictionaryParsingAndStemming() {
+        // 1. Wordset Modern English JSON
+        val wordsetSample = """
+            {
+              "serendipity": {
+                "word": "serendipity",
+                "meanings": [
+                  {
+                    "def": "good luck in making unexpected and fortunate discoveries",
+                    "example": "finding that bookstore was pure serendipity",
+                    "speech_part": "noun"
+                  }
+                ]
+              }
+            }
+        """.trimIndent()
+        val wsEntries = OfflineDictionaryService.parseWordsetJson(wordsetSample)
+        assertEquals(1, wsEntries.size)
+        assertEquals(DictionaryPack.MODERN_WORDSET.id, wsEntries[0].dictId)
+        assertEquals("serendipity", wsEntries[0].headword)
+        assertTrue(wsEntries[0].definition.contains("(noun)"))
+        assertTrue(wsEntries[0].definition.contains("pure serendipity"))
 
+        // 2. GCIDE Literary English CSV
+        val gcideRow = "Resilient,a.,\"Leaping or springing back; rebounding.\""
+        val gcideParsed = OfflineDictionaryService.parseGcideCsvRow(gcideRow)
+        assertNotNull(gcideParsed)
+        assertEquals("resilient", gcideParsed.first)
+        assertEquals("(a.) Leaping or springing back; rebounding.", gcideParsed.second)
+
+        // 3. Webster 1828 CSV
+        val w1828Row = "\"PERSEVERANCE\",\"Persistence in any thing undertaken; continued pursuit or prosecution of any business.\""
+        val w1828Entry = OfflineDictionaryService.parseCsvRow(w1828Row)
+        assertNotNull(w1828Entry)
+        assertEquals(DictionaryPack.WEBSTER_1828.id, w1828Entry.dictId)
+        assertEquals("perseverance", w1828Entry.headword)
+
+        // 4. Free Dictionary API JSON
+        val apiJson = """
+            [{"word":"ephemeral","phonetic":"/ɪˈfɛm.ə.rəl/","meanings":[{"partOfSpeech":"adjective","definitions":[{"definition":"Lasting for a very short time.","example":"fashions are ephemeral"}]}]}]
+        """.trimIndent()
+        val apiParsed = OfflineDictionaryService.parseFreeDictionaryApiJson(apiJson)
+        assertNotNull(apiParsed)
+        assertEquals("ephemeral", apiParsed.first)
+        assertTrue(apiParsed.second.contains("(adjective) Lasting for a very short time."))
+
+        // 5. Extraction & stemming
         assertEquals("journey", OfflineDictionaryService.extractWordAt("The journey started.", 6))
+        assertTrue(OfflineDictionaryService.buildEnglishCandidates("running").contains("run"))
+        assertTrue(OfflineDictionaryService.buildEnglishCandidates("speaketh").contains("speak"))
+        assertTrue(OfflineDictionaryService.buildEnglishCandidates("quietly").contains("quiet"))
+    }
 
-        val candidates = OfflineDictionaryService.buildEnglishCandidates("running")
-        assertTrue(candidates.contains("run"), "Expected stem 'run' in $candidates")
+    @Test
+    fun freeCatalogAndFilenameSanitization() {
+        assertTrue(FreeBooksCatalog.BOOKS.size >= 15, "Expected at least 15 curated classics")
+        assertEquals(
+            FreeBooksCatalog.BOOKS.size,
+            FreeBooksCatalog.BOOKS.map { it.id }.toSet().size,
+            "All catalog IDs must be unique",
+        )
+        assertEquals(
+            FreeBooksCatalog.BOOKS.size,
+            FreeBooksCatalog.BOOKS.map { it.fileName }.toSet().size,
+            "All catalog filenames must be unique",
+        )
+        assertTrue(FreeBooksCatalog.BOOKS.all { it.downloadUrl.startsWith("https://standardebooks.org/") })
 
-        val archaic = OfflineDictionaryService.buildEnglishCandidates("speaketh")
-        assertTrue(archaic.contains("speak"), "Expected stem 'speak' in $archaic")
+        assertEquals("https://example.com/a.epub", FreeBooksCatalog.normalizeUrl("example.com/a.epub"))
+        assertEquals("my_book.epub", FreeBooksCatalog.sanitizeBookFileName("dir/my_book.epub?dl=1"))
+        assertEquals("document.pdf", FreeBooksCatalog.sanitizeBookFileName("document", "application/pdf"))
+    }
+
+    @Test
+    fun wifiBookServerUploadListAndDeleteRoundTrip() {
+        val tempDir = Files.createTempDirectory("wifi_server_test_").toFile()
+        val events = mutableListOf<String>()
+        val server = WifiBookServer(tempDir) { msg -> events.add(msg) }
+        try {
+            val startResult = server.start()
+            // Even in environments without a LAN IP, the ServerSocket should bind locally
+            val port = server.boundPort
+            assertTrue(port > 0, "Expected WifiBookServer to bind a port, result=$startResult")
+
+            // 1. GET / serves HTML upload page
+            val htmlConn = (URI("http://127.0.0.1:$port/").toURL().openConnection() as HttpURLConnection)
+            assertEquals(200, htmlConn.responseCode)
+            val html = htmlConn.inputStream.bufferedReader().readText()
+            assertTrue(html.contains("Light Phone E-Reader"))
+            htmlConn.disconnect()
+
+            // 2. POST /api/upload streams book bytes to disk
+            val bookContent = "CHAPTER 1\n\nHello from Wi-Fi Transfer!"
+            val upConn = (URI("http://127.0.0.1:$port/api/upload?name=test_novel.txt").toURL().openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                doOutput = true
+                setFixedLengthStreamingMode(bookContent.toByteArray().size)
+            }
+            upConn.outputStream.use { it.write(bookContent.toByteArray()) }
+            assertEquals(200, upConn.responseCode)
+            val upBody = upConn.inputStream.bufferedReader().readText()
+            assertTrue(upBody.contains("\"ok\":true"))
+            upConn.disconnect()
+
+            val savedFile = File(tempDir, "test_novel.txt")
+            assertTrue(savedFile.isFile)
+            assertEquals(bookContent, savedFile.readText())
+            assertTrue(events.any { it.contains("test_novel.txt") })
+
+            // 3. GET /api/books lists the uploaded book
+            val listConn = (URI("http://127.0.0.1:$port/api/books").toURL().openConnection() as HttpURLConnection)
+            assertEquals(200, listConn.responseCode)
+            val listJson = listConn.inputStream.bufferedReader().readText()
+            assertTrue(listJson.contains("test_novel.txt"))
+            listConn.disconnect()
+
+            // 4. POST /api/delete removes the book
+            val delConn = (URI("http://127.0.0.1:$port/api/delete?name=test_novel.txt").toURL().openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+            }
+            assertEquals(200, delConn.responseCode)
+            delConn.disconnect()
+            assertFalse(savedFile.exists())
+        } finally {
+            server.stop()
+            tempDir.deleteRecursively()
+        }
     }
 
     @Test

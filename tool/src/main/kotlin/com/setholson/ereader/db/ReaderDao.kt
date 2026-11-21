@@ -51,14 +51,29 @@ interface BookBookmarkDao {
 
 @Dao
 interface DictDao {
-    @Query("SELECT * FROM dict_entries WHERE headword = :headword LIMIT 3")
-    suspend fun lookupExact(headword: String): List<DictEntryEntity>
+    @Query("SELECT * FROM dict_entries WHERE dictId = :dictId AND headword = :headword LIMIT 3")
+    suspend fun lookupInDict(dictId: String, headword: String): List<DictEntryEntity>
+
+    @Query("SELECT * FROM dict_entries WHERE headword = :headword LIMIT 12")
+    suspend fun lookupAcrossAll(headword: String): List<DictEntryEntity>
+
+    @Query("SELECT dictId, COUNT(*) AS entryCount FROM dict_entries GROUP BY dictId")
+    fun getCountsByDict(): Flow<List<DictCountRow>>
+
+    @Query("SELECT dictId, COUNT(*) AS entryCount FROM dict_entries GROUP BY dictId")
+    suspend fun getCountsByDictSync(): List<DictCountRow>
+
+    @Query("SELECT COUNT(*) FROM dict_entries WHERE dictId = :dictId")
+    suspend fun countForDict(dictId: String): Int
 
     @Query("SELECT COUNT(*) FROM dict_entries")
-    suspend fun countEntries(): Int
+    suspend fun countAll(): Int
 
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertBatch(entries: List<DictEntryEntity>)
+
+    @Query("DELETE FROM dict_entries WHERE dictId = :dictId")
+    suspend fun deleteByDict(dictId: String)
 
     @Query("DELETE FROM dict_entries")
     suspend fun clearAll()
