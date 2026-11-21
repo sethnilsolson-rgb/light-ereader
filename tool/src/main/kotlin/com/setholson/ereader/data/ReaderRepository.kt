@@ -19,7 +19,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 import java.io.File
+import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 
 class ReaderRepository(
@@ -33,6 +36,13 @@ class ReaderRepository(
 
     private val metadataCache = ConcurrentHashMap<String, BookMetadata>()
     private val parsedBookCache = ConcurrentHashMap<String, ParsedBook>()
+    private val pdfTextMemoryCache = ConcurrentHashMap<String, CachedPdfTextBook>()
+    private val pdfTextJson = Json { ignoreUnknownKeys = true }
+
+    private val pdfTextCacheDir: File
+        get() = File(appFilesDir, "pdf_text_cache").apply {
+            if (!exists()) mkdirs()
+        }
 
     val bookmarks: Flow<List<BookBookmarkEntity>> = database.bookmarkDao().getAllBookmarks()
     val bookmarkCount: Flow<Int> = database.bookmarkDao().getBookmarkCount()
@@ -100,6 +110,87 @@ class ReaderRepository(
         database.settingDao().putSetting(
             ReaderSettingEntity("$KEY_PDF_ROTATION_PREFIX$bookId", normalized.toString())
         )
+    }
+
+    suspend fun getPdfTextModeSync(bookId: String): Boolean = withContext(Dispatchers.IO) {
+        database.settingDao().getSettingSync("$KEY_PDF_TEXT_MODE_PREFIX$bookId")
+            ?.toBooleanStrictOrNull() ?: false
+    }
+
+    suspend fun setPdfTextMode(bookId: String, enabled: Boolean) = withContext(Dispatchers.IO) {
+        database.settingDao().putSetting(
+            ReaderSettingEntity("$KEY_PDF_TEXT_MODE_PREFIX$bookId", enabled.toString())
+        )
+    }
+
+    private fun bookIdHash(bookId: String): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest(bookId.toByteArray(Charsets.UTF_8))
+        return digest.take(16).joinToString("") { "%02x".format(it) }
+    }
+
+    private fun pdfTextCacheFile(bookId: String, lastModified: Long): File =
+        File(pdfTextCacheDir, "${bookIdHash(bookId)}_$lastModified.json")
+
+    private fun clearPdfTextCacheFilesFor(bookId: String) {
+        val prefix = "${bookIdHash(bookId)}_"
+        pdfTextCacheDir.listFiles()?.forEach { f ->
+            if (f.name.startsWith(prefix)) f.delete()
+        }
+        pdfTextMemoryCache.keys.filter { it.startsWith("$bookId|") }.forEach {
+            pdfTextMemoryCache.remove(it)
+        }
+    }
+
+    suspend fun getCachedPdfTextSync(bookId: String): CachedPdfTextBook? = withContext(Dispatchers.IO) {
+        val file = resolveBookFile(bookId) ?: return@withContext null
+        val memKey = "$bookId|${file.lastModified()}"
+        pdfTextMemoryCache[memKey]?.let { return@withContext it }
+
+        val cacheFile = pdfTextCacheFile(bookId, file.lastModified())
+        if (!cacheFile.isFile) return@withContext null
+        runCatching {
+            val decoded = pdfTextJson.decodeFromString<CachedPdfTextBook>(cacheFile.readText(Charsets.UTF_8))
+            if (pdfTextMemoryCache.size >= 3) pdfTextMemoryCache.clear()
+            pdfTextMemoryCache[memKey] = decoded
+            decoded
+        }.getOrNull()
+    }
+
+    suspend fun extractOrLoadPdfText(
+        bookId: String,
+        onProgress: (currentPage: Int, totalPages: Int) -> Unit = { _, _ -> },
+        isCancelled: () -> Boolean = { false },
+    ): PdfTextExtractionResult = withContext(Dispatchers.IO) {
+        val file = resolveBookFile(bookId) ?: return@withContext PdfTextExtractionResult.Error("PDF file not found.")
+        val memKey = "$bookId|${file.lastModified()}"
+        pdfTextMemoryCache[memKey]?.let { return@withContext PdfTextExtractionResult.Success(it) }
+
+        val cacheFile = pdfTextCacheFile(bookId, file.lastModified())
+        if (cacheFile.isFile) {
+            val cached = runCatching {
+                pdfTextJson.decodeFromString<CachedPdfTextBook>(cacheFile.readText(Charsets.UTF_8))
+            }.getOrNull()
+            if (cached != null) {
+                if (pdfTextMemoryCache.size >= 3) pdfTextMemoryCache.clear()
+                pdfTextMemoryCache[memKey] = cached
+                return@withContext PdfTextExtractionResult.Success(cached)
+            }
+        }
+
+        val result = PdfTextExtractor.extract(
+            file = file,
+            onProgress = onProgress,
+            isCancelled = isCancelled,
+        )
+        if (result is PdfTextExtractionResult.Success) {
+            clearPdfTextCacheFilesFor(bookId)
+            runCatching {
+                cacheFile.writeText(pdfTextJson.encodeToString(result.book), Charsets.UTF_8)
+            }
+            if (pdfTextMemoryCache.size >= 3) pdfTextMemoryCache.clear()
+            pdfTextMemoryCache[memKey] = result.book
+        }
+        result
     }
 
     suspend fun setPrimaryDictionary(pack: DictionaryPack) = withContext(Dispatchers.IO) {
@@ -458,6 +549,7 @@ class ReaderRepository(
         database.bookmarkDao().deleteAllForBook(bookId)
         metadataCache.keys.filter { it.startsWith("$bookId|") }.forEach { metadataCache.remove(it) }
         parsedBookCache.keys.filter { it.startsWith("$bookId|") }.forEach { parsedBookCache.remove(it) }
+        clearPdfTextCacheFilesFor(bookId)
         if (deleted) ReaderEntryPoint.notifyLibraryChanged()
         deleted
     }
@@ -468,6 +560,7 @@ class ReaderRepository(
         private const val KEY_PROGRESS_MODE = "progress_mode"
         private const val KEY_PDF_DARK_INVERT = "pdf_dark_invert"
         private const val KEY_PDF_ROTATION_PREFIX = "pdf_rot_"
+        private const val KEY_PDF_TEXT_MODE_PREFIX = "pdf_text_mode_"
         private const val KEY_PRIMARY_DICT = "primary_dict"
         private const val KEY_ONLINE_DICT_ENABLED = "online_dict_enabled"
 

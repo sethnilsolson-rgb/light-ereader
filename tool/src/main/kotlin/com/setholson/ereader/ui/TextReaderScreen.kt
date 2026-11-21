@@ -758,7 +758,7 @@ class TextReaderScreen(
 }
 
 @Composable
-private fun LookupableReaderText(
+internal fun LookupableReaderText(
     text: String,
     variant: LightTextVariant,
     lighten: Boolean,
@@ -816,7 +816,7 @@ private fun TextUnit.scaledUnit(): TextUnit {
 }
 
 @Composable
-private fun DictionaryOverlayCard(
+internal fun DictionaryOverlayCard(
     isLookingUp: Boolean,
     result: WordLookupResult?,
     onDismiss: () -> Unit,
