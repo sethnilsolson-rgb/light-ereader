@@ -20,18 +20,21 @@ data class RenderedPdfPage(
     val pageCount: Int,
     val pageWidthPt: Int,
     val pageHeightPt: Int,
+    val rotationDegrees: Int = 0,
 )
 
 /**
  * Thread-safe native Android [PdfRenderer] wrapper for local PDF files.
- * Strictly preserves exact page aspect ratios and supports crisp vector-rendered
- * viewport tiles at high zoom levels (up to 8x).
+ * Strictly preserves exact page aspect ratios, supports 0/90/180/270-degree rotation,
+ * and renders razor-sharp vector viewport tiles at high zoom levels (up to 8x).
  */
 object PdfBookLoader {
 
     private const val MAX_BASE_SIDE_PX = 2400
     private const val MAX_BASE_PIXELS = 6_000_000L
     private const val MAX_TILE_SIDE_PX = 1440
+
+    private fun normalizeRotation(degrees: Int): Int = ((degrees % 360) + 360) % 360
 
     fun peekMetadata(file: File): BookMetadata {
         val title = EpubParser.cleanFilenameTitle(file.nameWithoutExtension)
@@ -56,45 +59,61 @@ object PdfBookLoader {
 
     /**
      * Renders [pageIndex] (0-based) to a crisp white-backed [Bitmap] using a single uniform
-     * scale factor so the exact PDF page aspect ratio is NEVER distorted.
+     * scale factor so the exact PDF page aspect ratio is NEVER distorted, then rotates by
+     * [rotationDegrees] (0, 90, 180, or 270 clockwise).
      */
     fun renderPage(
         file: File,
         pageIndex: Int,
         targetWidthPx: Int = 2160,
+        rotationDegrees: Int = 0,
     ): Result<RenderedPdfPage> = runCatching {
         require(file.isFile) { "PDF file not found" }
+        val rot = normalizeRotation(rotationDegrees)
         ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { pfd ->
             PdfRenderer(pfd).use { renderer ->
                 val count = renderer.pageCount
                 require(count > 0) { "PDF has no pages" }
                 val safeIndex = pageIndex.coerceIn(0, count - 1)
                 renderer.openPage(safeIndex).use { page ->
-                    val pageW = page.width.coerceAtLeast(1)
-                    val pageH = page.height.coerceAtLeast(1)
+                    val rawW = page.width.coerceAtLeast(1)
+                    val rawH = page.height.coerceAtLeast(1)
+                    val isSideways = rot == 90 || rot == 270
+                    val effW = if (isSideways) rawH else rawW
+                    val effH = if (isSideways) rawW else rawH
 
-                    val scaleByWidth = targetWidthPx.coerceIn(600, MAX_BASE_SIDE_PX).toFloat() / pageW.toFloat()
-                    val scaleByMaxSide = MAX_BASE_SIDE_PX.toFloat() / max(pageW, pageH).toFloat()
-                    val scaleByPixels = sqrt(MAX_BASE_PIXELS.toDouble() / (pageW.toDouble() * pageH.toDouble())).toFloat()
+                    val scaleByWidth = targetWidthPx.coerceIn(600, MAX_BASE_SIDE_PX).toFloat() / effW.toFloat()
+                    val scaleByMaxSide = MAX_BASE_SIDE_PX.toFloat() / max(rawW, rawH).toFloat()
+                    val scaleByPixels = sqrt(MAX_BASE_PIXELS.toDouble() / (rawW.toDouble() * rawH.toDouble())).toFloat()
                     val uniformScale = min(scaleByWidth, min(scaleByMaxSide, scaleByPixels)).coerceAtLeast(0.25f)
 
-                    val bmpW = (pageW * uniformScale).roundToInt().coerceAtLeast(1)
-                    val bmpH = (pageH * uniformScale).roundToInt().coerceAtLeast(1)
+                    val bmpW = (rawW * uniformScale).roundToInt().coerceAtLeast(1)
+                    val bmpH = (rawH * uniformScale).roundToInt().coerceAtLeast(1)
 
-                    val bitmap = Bitmap.createBitmap(bmpW, bmpH, Bitmap.Config.ARGB_8888)
-                    val canvas = Canvas(bitmap)
+                    val rawBitmap = Bitmap.createBitmap(bmpW, bmpH, Bitmap.Config.ARGB_8888)
+                    val canvas = Canvas(rawBitmap)
                     canvas.drawColor(Color.WHITE)
 
                     val matrix = Matrix().apply {
-                        postScale(bmpW.toFloat() / pageW.toFloat(), bmpH.toFloat() / pageH.toFloat())
+                        postScale(bmpW.toFloat() / rawW.toFloat(), bmpH.toFloat() / rawH.toFloat())
                     }
-                    page.render(bitmap, null, matrix, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                    page.render(rawBitmap, null, matrix, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+
+                    val finalBitmap = if (rot == 0) {
+                        rawBitmap
+                    } else {
+                        val rotMatrix = Matrix().apply { postRotate(rot.toFloat()) }
+                        Bitmap.createBitmap(rawBitmap, 0, 0, rawBitmap.width, rawBitmap.height, rotMatrix, true).also {
+                            if (it !== rawBitmap) rawBitmap.recycle()
+                        }
+                    }
 
                     RenderedPdfPage(
-                        bitmap = bitmap,
+                        bitmap = finalBitmap,
                         pageCount = count,
-                        pageWidthPt = pageW,
-                        pageHeightPt = pageH,
+                        pageWidthPt = effW,
+                        pageHeightPt = effH,
+                        rotationDegrees = rot,
                     )
                 }
             }
@@ -103,8 +122,9 @@ object PdfBookLoader {
 
     /**
      * Renders ONLY the currently visible zoomed viewport directly from PDF vector data
-     * using the exact screen transform ([totalScale], [translateX], [translateY]).
-     * Keeps memory tiny (~3-4 MB) while keeping text razor-sharp up to 8x zoom.
+     * using the exact screen transform ([totalScale], [translateX], [translateY]) and
+     * [rotationDegrees]. Uses strictly positive scale in [PdfRenderer] and rotates the
+     * small tile bitmap afterwards for 100% reliability across all Android builds.
      */
     fun renderViewportTile(
         file: File,
@@ -114,31 +134,72 @@ object PdfBookLoader {
         totalScale: Float,
         translateX: Float,
         translateY: Float,
+        rotationDegrees: Int = 0,
     ): Result<Bitmap> = runCatching {
         require(file.isFile) { "PDF file not found" }
         require(viewportWidthPx > 0 && viewportHeightPx > 0) { "Invalid viewport" }
+        val rot = normalizeRotation(rotationDegrees)
         ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { pfd ->
             PdfRenderer(pfd).use { renderer ->
                 val count = renderer.pageCount
                 require(count > 0) { "PDF has no pages" }
                 val safeIndex = pageIndex.coerceIn(0, count - 1)
                 renderer.openPage(safeIndex).use { page ->
+                    val rawW = page.width.toFloat().coerceAtLeast(1f)
+                    val rawH = page.height.toFloat().coerceAtLeast(1f)
+
                     val maxDim = max(viewportWidthPx, viewportHeightPx)
                     val tileRatio = min(1f, MAX_TILE_SIDE_PX.toFloat() / maxDim.toFloat())
                     val tileW = (viewportWidthPx * tileRatio).roundToInt().coerceAtLeast(1)
                     val tileH = (viewportHeightPx * tileRatio).roundToInt().coerceAtLeast(1)
 
-                    val bitmap = Bitmap.createBitmap(tileW, tileH, Bitmap.Config.ARGB_8888)
-                    val canvas = Canvas(bitmap)
+                    val s = totalScale * tileRatio
+                    val tx = translateX * tileRatio
+                    val ty = translateY * tileRatio
+
+                    val unrotW: Int
+                    val unrotH: Int
+                    val ux: Float
+                    val uy: Float
+
+                    when (rot) {
+                        90 -> {
+                            unrotW = tileH
+                            unrotH = tileW
+                            ux = ty
+                            uy = tileW - tx - rawH * s
+                        }
+                        180 -> {
+                            unrotW = tileW
+                            unrotH = tileH
+                            ux = tileW - tx - rawW * s
+                            uy = tileH - ty - rawH * s
+                        }
+                        270 -> {
+                            unrotW = tileH
+                            unrotH = tileW
+                            ux = tileH - ty - rawW * s
+                            uy = tx
+                        }
+                        else -> {
+                            unrotW = tileW
+                            unrotH = tileH
+                            ux = tx
+                            uy = ty
+                        }
+                    }
+
+                    val rawTile = Bitmap.createBitmap(unrotW, unrotH, Bitmap.Config.ARGB_8888)
+                    val canvas = Canvas(rawTile)
                     canvas.drawColor(Color.TRANSPARENT)
 
                     val matrix = Matrix().apply {
-                        postScale(totalScale * tileRatio, totalScale * tileRatio)
-                        postTranslate(translateX * tileRatio, translateY * tileRatio)
+                        postScale(s, s)
+                        postTranslate(ux, uy)
                     }
 
-                    // Fill only the transformed page bounds with white so margins stay transparent
-                    val pageBounds = RectF(0f, 0f, page.width.toFloat(), page.height.toFloat())
+                    // Fill only the transformed page bounds with white so outer margins stay transparent
+                    val pageBounds = RectF(0f, 0f, rawW, rawH)
                     matrix.mapRect(pageBounds)
                     val whitePaint = Paint().apply {
                         color = Color.WHITE
@@ -146,8 +207,16 @@ object PdfBookLoader {
                     }
                     canvas.drawRect(pageBounds, whitePaint)
 
-                    page.render(bitmap, null, matrix, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                    bitmap
+                    page.render(rawTile, null, matrix, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+
+                    if (rot == 0) {
+                        rawTile
+                    } else {
+                        val rotMatrix = Matrix().apply { postRotate(rot.toFloat()) }
+                        Bitmap.createBitmap(rawTile, 0, 0, rawTile.width, rawTile.height, rotMatrix, true).also {
+                            if (it !== rawTile) rawTile.recycle()
+                        }
+                    }
                 }
             }
         }

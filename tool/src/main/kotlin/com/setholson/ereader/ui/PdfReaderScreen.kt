@@ -26,7 +26,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
@@ -97,6 +96,7 @@ private val INVERT_COLOR_FILTER = ColorFilter.colorMatrix(
 data class CrispPdfTile(
     val bitmap: Bitmap,
     val pageIndex: Int,
+    val rotationDegrees: Int,
     val scale: Float,
     val offsetX: Float,
     val offsetY: Float,
@@ -133,6 +133,9 @@ class PdfReaderViewModel(
     private val _invertColors = MutableStateFlow(false)
     val invertColors: StateFlow<Boolean> = _invertColors.asStateFlow()
 
+    private val _rotationDegrees = MutableStateFlow(0)
+    val rotationDegrees: StateFlow<Int> = _rotationDegrees.asStateFlow()
+
     private val _progressMode = MutableStateFlow(ReaderProgressMode.BOOK)
     val progressMode: StateFlow<ReaderProgressMode> = _progressMode.asStateFlow()
 
@@ -151,13 +154,14 @@ class PdfReaderViewModel(
             viewModelScope.launch {
                 val autoInvert = repository.getPdfDarkInvertSync()
                 _invertColors.value = autoInvert && LightThemeController.isDarkTheme
+                _rotationDegrees.value = repository.getPdfRotationSync(bookId)
                 val savedPage = repository.getProgressSync(bookId)?.currentPosition ?: 0
                 openPage(explicitStartPage ?: savedPage)
             }
         }
     }
 
-    fun openPage(index: Int) {
+    fun openPage(index: Int, rotation: Int = _rotationDegrees.value) {
         renderJob?.cancel()
         tileJob?.cancel()
         _crispTile.value = null
@@ -166,7 +170,12 @@ class PdfReaderViewModel(
             _isLoading.value = true
             _errorText.value = null
 
-            val result = repository.renderPdfPage(bookId, index, targetWidthPx = 2160)
+            val result = repository.renderPdfPage(
+                bookId = bookId,
+                pageIndex = index,
+                targetWidthPx = 2160,
+                rotationDegrees = rotation,
+            )
             _isLoading.value = false
 
             result.onSuccess { page ->
@@ -196,8 +205,20 @@ class PdfReaderViewModel(
         }
     }
 
+    fun rotateClockwise() {
+        val next = (_rotationDegrees.value + 90) % 360
+        _rotationDegrees.value = next
+        viewModelScope.launch {
+            repository.setPdfRotation(bookId, next)
+        }
+        if (_pageCount.value > 0) {
+            openPage(_pageIndex.value, rotation = next)
+        }
+    }
+
     fun requestCrispTile(
         pageIndex: Int,
+        rotationDegrees: Int,
         viewportWidthPx: Int,
         viewportHeightPx: Int,
         totalScale: Float,
@@ -218,12 +239,14 @@ class PdfReaderViewModel(
                 totalScale = totalScale,
                 translateX = translateX,
                 translateY = translateY,
+                rotationDegrees = rotationDegrees,
             )
             result.onSuccess { bmp ->
-                if (_pageIndex.value == pageIndex) {
+                if (_pageIndex.value == pageIndex && _rotationDegrees.value == rotationDegrees) {
                     _crispTile.value = CrispPdfTile(
                         bitmap = bmp,
                         pageIndex = pageIndex,
+                        rotationDegrees = rotationDegrees,
                         scale = scaleKey,
                         offsetX = offsetXKey,
                         offsetY = offsetYKey,
@@ -328,6 +351,7 @@ class PdfReaderScreen(
         val errorText by viewModel.errorText.collectAsState()
         val isBookmarked by viewModel.isBookmarked.collectAsState()
         val invertColors by viewModel.invertColors.collectAsState()
+        val rotationDegrees by viewModel.rotationDegrees.collectAsState()
         val progressMode by viewModel.progressMode.collectAsState()
 
         val density = LocalDensity.current
@@ -338,7 +362,7 @@ class PdfReaderScreen(
         var offsetX by remember { mutableFloatStateOf(0f) }
         var offsetY by remember { mutableFloatStateOf(0f) }
         var isGesturing by remember { mutableStateOf(false) }
-        var initializedForPage by remember { mutableIntStateOf(-1) }
+        var initializedKey by remember { mutableStateOf("") }
 
         val boxW = boxSize.width.toFloat()
         val boxH = boxSize.height.toFloat()
@@ -387,17 +411,19 @@ class PdfReaderScreen(
             offsetY = 0f
         }
 
-        // Whenever a new page finishes rendering & layout is measured, start cleanly at Fit Width (top of page)
-        LaunchedEffect(pageIndex, renderedPage, boxSize) {
-            if (renderedPage != null && boxSize.width > 0 && boxSize.height > 0 && initializedForPage != pageIndex) {
-                initializedForPage = pageIndex
+        // Whenever a new page or rotation finishes rendering & layout is measured, start cleanly at Fit Width (top of page)
+        val currentInitKey = renderedPage?.let { "$pageIndex|${it.rotationDegrees}" }.orEmpty()
+        LaunchedEffect(currentInitKey, boxSize) {
+            if (renderedPage != null && boxSize.width > 0 && boxSize.height > 0 && initializedKey != currentInitKey) {
+                initializedKey = currentInitKey
                 resetToFitWidthTop()
             }
         }
 
         // Render razor-sharp vector viewport tile whenever user settles past 1.35x zoom
         LaunchedEffect(pageIndex, renderedPage, scale, offsetX, offsetY, isGesturing, boxSize) {
-            if (isGesturing || renderedPage == null || boxSize.width <= 0 || boxSize.height <= 0 || scale <= 1.35f) {
+            val page = renderedPage
+            if (isGesturing || page == null || boxSize.width <= 0 || boxSize.height <= 0 || scale <= 1.35f) {
                 viewModel.clearCrispTile()
                 return@LaunchedEffect
             }
@@ -406,6 +432,7 @@ class PdfReaderScreen(
             val ty = (boxH - baseH * scale) / 2f + offsetY
             viewModel.requestCrispTile(
                 pageIndex = pageIndex,
+                rotationDegrees = page.rotationDegrees,
                 viewportWidthPx = boxSize.width,
                 viewportHeightPx = boxSize.height,
                 totalScale = totalScale,
@@ -508,7 +535,13 @@ class PdfReaderScreen(
                             highlighted = false,
                             onClick = { applyCenteredZoom(scale * 1.35f) },
                         )
-                        Spacer(modifier = Modifier.width(6.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        PdfControlChip(
+                            label = if (rotationDegrees == 0) "↻" else "${rotationDegrees}°",
+                            highlighted = rotationDegrees != 0,
+                            onClick = { viewModel.rotateClockwise() },
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
                         PdfControlChip(
                             label = "Inv",
                             highlighted = invertColors,
@@ -701,6 +734,7 @@ class PdfReaderScreen(
                                 val activeTile = crispTile?.takeIf { tile ->
                                     !isGesturing &&
                                         tile.pageIndex == pageIndex &&
+                                        tile.rotationDegrees == page.rotationDegrees &&
                                         abs(tile.scale - scale) < 0.001f &&
                                         abs(tile.offsetX - offsetX) < 0.5f &&
                                         abs(tile.offsetY - offsetY) < 0.5f

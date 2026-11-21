@@ -90,6 +90,18 @@ class ReaderRepository(
         database.settingDao().getSettingSync(KEY_PDF_DARK_INVERT)?.toBooleanStrictOrNull() ?: true
     }
 
+    suspend fun getPdfRotationSync(bookId: String): Int = withContext(Dispatchers.IO) {
+        val raw = database.settingDao().getSettingSync("$KEY_PDF_ROTATION_PREFIX$bookId")?.toIntOrNull() ?: 0
+        ((raw % 360) + 360) % 360
+    }
+
+    suspend fun setPdfRotation(bookId: String, rotationDegrees: Int) = withContext(Dispatchers.IO) {
+        val normalized = ((rotationDegrees % 360) + 360) % 360
+        database.settingDao().putSetting(
+            ReaderSettingEntity("$KEY_PDF_ROTATION_PREFIX$bookId", normalized.toString())
+        )
+    }
+
     suspend fun setPrimaryDictionary(pack: DictionaryPack) = withContext(Dispatchers.IO) {
         database.settingDao().putSetting(ReaderSettingEntity(KEY_PRIMARY_DICT, pack.id))
     }
@@ -306,11 +318,12 @@ class ReaderRepository(
         bookId: String,
         pageIndex: Int,
         targetWidthPx: Int = 2160,
+        rotationDegrees: Int = 0,
     ): Result<RenderedPdfPage> = withContext(Dispatchers.IO) {
         val file = resolveBookFile(bookId) ?: return@withContext Result.failure(
             IllegalStateException("PDF file not found.")
         )
-        PdfBookLoader.renderPage(file, pageIndex, targetWidthPx)
+        PdfBookLoader.renderPage(file, pageIndex, targetWidthPx, rotationDegrees)
     }
 
     suspend fun renderPdfViewportTile(
@@ -321,6 +334,7 @@ class ReaderRepository(
         totalScale: Float,
         translateX: Float,
         translateY: Float,
+        rotationDegrees: Int = 0,
     ): Result<Bitmap> = withContext(Dispatchers.IO) {
         val file = resolveBookFile(bookId) ?: return@withContext Result.failure(
             IllegalStateException("PDF file not found.")
@@ -333,6 +347,7 @@ class ReaderRepository(
             totalScale = totalScale,
             translateX = translateX,
             translateY = translateY,
+            rotationDegrees = rotationDegrees,
         )
     }
 
@@ -452,6 +467,7 @@ class ReaderRepository(
         private const val KEY_FONT_SIZE = "font_size"
         private const val KEY_PROGRESS_MODE = "progress_mode"
         private const val KEY_PDF_DARK_INVERT = "pdf_dark_invert"
+        private const val KEY_PDF_ROTATION_PREFIX = "pdf_rot_"
         private const val KEY_PRIMARY_DICT = "primary_dict"
         private const val KEY_ONLINE_DICT_ENABLED = "online_dict_enabled"
 
