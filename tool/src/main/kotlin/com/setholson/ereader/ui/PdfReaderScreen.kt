@@ -267,7 +267,7 @@ class PdfReaderViewModel(
             val result = repository.renderPdfPage(
                 bookId = bookId,
                 pageIndex = index,
-                targetWidthPx = 2160,
+                targetWidthPx = 1440,
                 rotationDegrees = rotation,
             )
             _isLoading.value = false

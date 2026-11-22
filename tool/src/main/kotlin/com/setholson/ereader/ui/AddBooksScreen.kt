@@ -115,11 +115,23 @@ class AddBooksViewModel(
         }
     }
 
+    override fun onScreenHide(screen: SimpleLightScreen<Unit>) {
+        stopWifiServer()
+        super.onScreenHide(screen)
+    }
+
+    override fun onAppPause() {
+        stopWifiServer()
+        super.onAppPause()
+    }
+
     fun selectTab(tab: AddBooksTab) {
         _activeTab.value = tab
         _errorText.value = null
         if (tab == AddBooksTab.WIFI && _serverUrl.value == null) {
             startWifiServer()
+        } else if (tab != AddBooksTab.WIFI) {
+            stopWifiServer()
         }
     }
 
