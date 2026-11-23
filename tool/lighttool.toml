@@ -1,8 +1,8 @@
 [tool]
 id = "com.setholson.ereader"
 label = "E-Reader"
-versionCode = 7
-versionName = "1.4.1"
+versionCode = 8
+versionName = "1.4.2"
 permissions = ["android.permission.INTERNET"]
 capabilities = ["tool-manager-provider"]
 # for the LightOS emulator, use the line below and build with -DlightSdk.allowAltServerPackage=true

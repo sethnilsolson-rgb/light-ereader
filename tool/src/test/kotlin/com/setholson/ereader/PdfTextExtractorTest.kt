@@ -196,6 +196,184 @@ class PdfTextExtractorTest {
         assertIs<PdfTextExtractionResult.Encrypted>(result)
     }
 
+    @Test
+    fun extractsFlippedYAxisPdfInCorrectTopToBottomOrder() {
+        // Common modern PDF export (Quartz / Skia / Canva / Chrome):
+        // CTM flips Y axis (`1 0 0 -1 0 792 cm`) and text uses negative d (`1 0 0 -1 x y Tm`).
+        // Previously this inverted top & bottom lines!
+        val flippedStream = """
+            q
+            1 0 0 -1 0 792 cm
+            BT
+            /F1 18 Tf
+            1 0 0 -1 72 80 Tm
+            (Top Heading of the Page) Tj
+            /F1 12 Tf
+            1 0 0 -1 72 120 Tm
+            (First line of paragraph one.) Tj
+            0 -16 Td
+            (Second line of paragraph one.) Tj
+            1 0 0 -1 72 180 Tm
+            (Bottom paragraph comes last.) Tj
+            ET
+            Q
+        """.trimIndent()
+
+        val pdf = buildSimplePdf(
+            objects = listOf(
+                1 to "<< /Type /Catalog /Pages 2 0 R >>",
+                2 to "<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources << /Font << /F1 4 0 R >> >> >>",
+                3 to "<< /Type /Page /Parent 2 0 R /Contents 5 0 R >>",
+                4 to "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+                5 to streamObject(flippedStream.toByteArray(Charsets.ISO_8859_1), compress = false),
+            ),
+            rootObj = 1,
+        )
+
+        val result = PdfTextExtractor.extractBytes(pdf)
+        val success = assertIs<PdfTextExtractionResult.Success>(result)
+        val blocks = success.book.pages[0].blocks
+        assertTrue(blocks.size >= 3, "Expected heading + 2 paragraphs, got: $blocks")
+        assertEquals("Top Heading of the Page", blocks[0].text)
+        assertTrue(blocks[1].text.startsWith("First line of paragraph one."), "Got: ${blocks[1].text}")
+        assertTrue(blocks[1].text.contains("Second line of paragraph one."), "Got: ${blocks[1].text}")
+        assertEquals("Bottom paragraph comes last.", blocks[2].text)
+    }
+
+    @Test
+    fun extractsFormXObjectWithCtmAndMatrixWithoutDroppingToBottom() {
+        // Callout box stored inside a Form XObject placed near top of page via CTM + /Matrix
+        val formStream = """
+            BT
+            /F1 12 Tf
+            0 0 Td
+            (Header inside Form XObject) Tj
+            ET
+        """.trimIndent()
+
+        val pageStream = """
+            q
+            1 0 0 1 72 740 cm
+            /Fm1 Do
+            Q
+            BT
+            /F1 12 Tf
+            72 680 Td
+            (Main body below the form header.) Tj
+            ET
+        """.trimIndent()
+
+        val formObj = buildByteStreamObject(
+            extraDictEntries = "/Type /XObject /Subtype /Form /Matrix [1 0 0 1 0 0] /Resources << /Font << /F1 4 0 R >> >>",
+            rawBytes = formStream.toByteArray(Charsets.ISO_8859_1),
+        )
+
+        val pdf = buildSimplePdf(
+            objects = listOf(
+                1 to "<< /Type /Catalog /Pages 2 0 R >>",
+                2 to "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+                3 to "<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> /XObject << /Fm1 5 0 R >> >> /Contents 6 0 R >>",
+                4 to "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+                5 to formObj,
+                6 to streamObject(pageStream.toByteArray(Charsets.ISO_8859_1), compress = false),
+            ),
+            rootObj = 1,
+        )
+
+        val result = PdfTextExtractor.extractBytes(pdf)
+        val success = assertIs<PdfTextExtractionResult.Success>(result)
+        val texts = success.book.pages[0].blocks.map { it.text }
+        assertEquals(2, texts.size, "Expected 2 blocks, got: $texts")
+        assertEquals("Header inside Form XObject", texts[0])
+        assertEquals("Main body below the form header.", texts[1])
+    }
+
+    @Test
+    fun smartLayoutSeparatesSideBySideCalloutBoxWithoutInterleaving() {
+        // Self-help book layout: full-width title, left main column, right callout box
+        val pageStream = """
+            BT
+            /F1 18 Tf
+            72 740 Td
+            (Chapter 3: Better Habits) Tj
+            /F1 11 Tf
+            1 0 0 1 72 690 Tm
+            (Left body line one explains) Tj
+            1 0 0 1 360 690 Tm
+            (KEY TAKEAWAY BOX) Tj
+            1 0 0 1 72 674 Tm
+            (the core habit loop clearly.) Tj
+            1 0 0 1 360 674 Tm
+            (Write down one tiny win) Tj
+            1 0 0 1 72 658 Tm
+            (Every cue leads to action.) Tj
+            1 0 0 1 360 658 Tm
+            (every single evening.) Tj
+            ET
+        """.trimIndent()
+
+        val pdf = buildSimplePdf(
+            objects = listOf(
+                1 to "<< /Type /Catalog /Pages 2 0 R >>",
+                2 to "<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources << /Font << /F1 4 0 R >> >> >>",
+                3 to "<< /Type /Page /Parent 2 0 R /Contents 5 0 R >>",
+                4 to "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+                5 to streamObject(pageStream.toByteArray(Charsets.ISO_8859_1), compress = false),
+            ),
+            rootObj = 1,
+        )
+
+        val result = PdfTextExtractor.extractBytes(pdf, com.setholson.ereader.data.PdfExtractionMode.SMART_LAYOUT)
+        val success = assertIs<PdfTextExtractionResult.Success>(result)
+        val texts = success.book.pages[0].blocks.map { it.text }
+        assertTrue(texts.size >= 3, "Expected title + left column + right callout box, got: $texts")
+        assertEquals("Chapter 3: Better Habits", texts[0])
+        assertTrue(
+            texts[1].contains("Left body line one explains") && texts[1].contains("Every cue leads to action.") && !texts[1].contains("KEY TAKEAWAY"),
+            "Main column must not interleave with right callout box, got: ${texts[1]}",
+        )
+        assertTrue(
+            texts[2].contains("KEY TAKEAWAY BOX") && texts[2].contains("every single evening."),
+            "Callout box should be grouped cleanly after main column, got: ${texts[2]}",
+        )
+    }
+
+    @Test
+    fun streamOrderModePreservesPdfInternalEmissionOrder() {
+        val stream = """
+            BT
+            /F1 12 Tf
+            72 200 Td
+            (Emitted first in stream.) Tj
+            1 0 0 1 72 700 Tm
+            (Emitted second in stream.) Tj
+            ET
+        """.trimIndent()
+
+        val pdf = buildSimplePdf(
+            objects = listOf(
+                1 to "<< /Type /Catalog /Pages 2 0 R >>",
+                2 to "<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources << /Font << /F1 4 0 R >> >> >>",
+                3 to "<< /Type /Page /Parent 2 0 R /Contents 5 0 R >>",
+                4 to "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+                5 to streamObject(stream.toByteArray(Charsets.ISO_8859_1), compress = false),
+            ),
+            rootObj = 1,
+        )
+
+        val streamRes = assertIs<PdfTextExtractionResult.Success>(
+            PdfTextExtractor.extractBytes(pdf, com.setholson.ereader.data.PdfExtractionMode.STREAM_ORDER)
+        )
+        assertEquals("Emitted first in stream.", streamRes.book.pages[0].blocks[0].text)
+        assertEquals("Emitted second in stream.", streamRes.book.pages[0].blocks[1].text)
+
+        val topDownRes = assertIs<PdfTextExtractionResult.Success>(
+            PdfTextExtractor.extractBytes(pdf, com.setholson.ereader.data.PdfExtractionMode.SINGLE_COLUMN)
+        )
+        assertEquals("Emitted second in stream.", topDownRes.book.pages[0].blocks[0].text)
+        assertEquals("Emitted first in stream.", topDownRes.book.pages[0].blocks[1].text)
+    }
+
     // -------------------------------------------------------------------------
     // Minimal synthetic PDF builder helpers for unit tests
     // -------------------------------------------------------------------------

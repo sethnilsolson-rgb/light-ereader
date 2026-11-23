@@ -53,6 +53,7 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewModelScope
 import com.setholson.ereader.data.CachedPdfTextBook
+import com.setholson.ereader.data.PdfExtractionMode
 import com.setholson.ereader.data.PdfTextExtractionResult
 import com.setholson.ereader.data.ReaderRepository
 import com.setholson.ereader.data.RenderedPdfPage
@@ -167,6 +168,9 @@ class PdfReaderViewModel(
     private val _extractedBook = MutableStateFlow<CachedPdfTextBook?>(null)
     val extractedBook: StateFlow<CachedPdfTextBook?> = _extractedBook.asStateFlow()
 
+    private val _extractionMode = MutableStateFlow(PdfExtractionMode.SMART_LAYOUT)
+    val extractionMode: StateFlow<PdfExtractionMode> = _extractionMode.asStateFlow()
+
     private val _fontSize = MutableStateFlow(ReaderFontSize.REGULAR)
     val fontSize: StateFlow<ReaderFontSize> = _fontSize.asStateFlow()
 
@@ -205,14 +209,22 @@ class PdfReaderViewModel(
                 val savedPage = repository.getProgressSync(bookId)?.currentPosition ?: 0
                 val startPage = explicitStartPage ?: savedPage
 
+                val savedMode = repository.getPdfExtractionModeSync(bookId)
+                _extractionMode.value = savedMode
                 val wantTextMode = repository.getPdfTextModeSync(bookId)
                 if (wantTextMode) {
-                    val cached = repository.getCachedPdfTextSync(bookId)
+                    val cached = repository.getCachedPdfTextSync(bookId, savedMode)
                     if (cached != null) {
                         _extractedBook.value = cached
                         _isTextMode.value = true
                         _isLoading.value = false
                         openTextPage(startPage, cached)
+                        return@launch
+                    } else {
+                        // Cache was from an older extractor version — re-extract cleanly in place!
+                        _pageIndex.value = startPage
+                        _isLoading.value = false
+                        enterTextMode(forceReextract = true, mode = savedMode)
                         return@launch
                     }
                 }
@@ -286,10 +298,14 @@ class PdfReaderViewModel(
         }
     }
 
-    fun enterTextMode() {
+    fun enterTextMode(
+        forceReextract: Boolean = false,
+        mode: PdfExtractionMode = _extractionMode.value,
+    ) {
         _textNotice.value = null
+        _extractionMode.value = mode
         val alreadyExtracted = _extractedBook.value
-        if (alreadyExtracted != null) {
+        if (!forceReextract && alreadyExtracted != null && alreadyExtracted.modeName == mode.name) {
             _isTextMode.value = true
             viewModelScope.launch { repository.setPdfTextMode(bookId, true) }
             openTextPage(_pageIndex.value, alreadyExtracted)
@@ -302,13 +318,16 @@ class PdfReaderViewModel(
         extractionCancelled = cancelFlag
 
         extractionJob = viewModelScope.launch {
+            repository.setPdfExtractionMode(bookId, mode)
             _isExtractingText.value = true
-            _extractionProgressText.value = "Reading PDF..."
+            _extractionProgressText.value = "Reading PDF (${mode.shortLabel})..."
 
             val result = repository.extractOrLoadPdfText(
                 bookId = bookId,
+                mode = mode,
+                forceReextract = forceReextract,
                 onProgress = { cur, total ->
-                    _extractionProgressText.value = "Page $cur / $total"
+                    _extractionProgressText.value = "Page $cur / $total (${mode.shortLabel})"
                 },
                 isCancelled = { cancelFlag.get() },
             )
@@ -338,6 +357,11 @@ class PdfReaderViewModel(
                 }
             }
         }
+    }
+
+    fun reextractWithMode(mode: PdfExtractionMode) {
+        dismissLookup()
+        enterTextMode(forceReextract = true, mode = mode)
     }
 
     fun cancelTextExtraction() {
@@ -550,6 +574,7 @@ class PdfReaderScreen(
         val extractionProgressText by viewModel.extractionProgressText.collectAsState()
         val textNotice by viewModel.textNotice.collectAsState()
         val extractedBook by viewModel.extractedBook.collectAsState()
+        val extractionMode by viewModel.extractionMode.collectAsState()
         val fontSize by viewModel.fontSize.collectAsState()
         val lookupEnabled by viewModel.lookupEnabled.collectAsState()
         val isLookingUp by viewModel.isLookingUp.collectAsState()
@@ -558,6 +583,7 @@ class PdfReaderScreen(
         val density = LocalDensity.current
         val haptics = LocalHapticFeedback.current
         var showJumpBar by remember { mutableStateOf(false) }
+        var showExtractPanel by remember { mutableStateOf(false) }
         var boxSize by remember { mutableStateOf(IntSize.Zero) }
 
         val textScrollState = rememberScrollState()
@@ -734,9 +760,21 @@ class PdfReaderScreen(
                             PdfControlChip(
                                 label = "Page",
                                 highlighted = false,
-                                onClick = { viewModel.exitTextMode() },
+                                onClick = {
+                                    showExtractPanel = false
+                                    viewModel.exitTextMode()
+                                },
                             )
-                            Spacer(modifier = Modifier.width(6.dp))
+                            Spacer(modifier = Modifier.width(5.dp))
+                            PdfControlChip(
+                                label = "Fix",
+                                highlighted = showExtractPanel,
+                                onClick = {
+                                    showExtractPanel = !showExtractPanel
+                                    if (showExtractPanel) showJumpBar = false
+                                },
+                            )
+                            Spacer(modifier = Modifier.width(5.dp))
                             PdfControlChip(
                                 label = fontSize.displayLabel,
                                 highlighted = false,
@@ -780,6 +818,81 @@ class PdfReaderScreen(
                                 highlighted = invertColors,
                                 onClick = { viewModel.toggleInvert() },
                             )
+                        }
+                    }
+
+                    // Text Extraction Retry & Layout Mode Panel (for boxes, sidebars & proofreading)
+                    if (isTextMode && showExtractPanel && !isExtractingText) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 1.0f.gridUnitsAsDp(), vertical = 4.dp)
+                                .border(
+                                    width = 1.dp,
+                                    color = LightThemeTokens.colors.content.copy(alpha = 0.45f),
+                                    shape = RoundedCornerShape(6.dp),
+                                )
+                                .padding(horizontal = 10.dp, vertical = 8.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                            ) {
+                                LightText(
+                                    text = "Text Layout: ${extractionMode.displayName}",
+                                    variant = LightTextVariant.Detail,
+                                )
+                                LightText(
+                                    text = "✕",
+                                    variant = LightTextVariant.Detail,
+                                    modifier = Modifier
+                                        .lightClickable { showExtractPanel = false }
+                                        .padding(horizontal = 4.dp),
+                                )
+                            }
+                            LightText(
+                                text = extractionMode.description,
+                                variant = LightTextVariant.Detail,
+                                lighten = true,
+                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                PdfExtractionMode.entries.forEach { mode ->
+                                    PdfControlChip(
+                                        label = mode.shortLabel,
+                                        highlighted = mode == extractionMode,
+                                        onClick = {
+                                            showExtractPanel = false
+                                            viewModel.reextractWithMode(mode)
+                                        },
+                                    )
+                                }
+                            }
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                PdfControlChip(
+                                    label = "Retry Extract",
+                                    highlighted = false,
+                                    onClick = {
+                                        showExtractPanel = false
+                                        viewModel.reextractWithMode(extractionMode)
+                                    },
+                                )
+                                PdfControlChip(
+                                    label = "Compare PDF Page",
+                                    highlighted = false,
+                                    onClick = {
+                                        showExtractPanel = false
+                                        viewModel.exitTextMode()
+                                    },
+                                )
+                            }
                         }
                     }
 
@@ -926,11 +1039,18 @@ class PdfReaderScreen(
                                                 variant = LightTextVariant.Detail,
                                                 lighten = true,
                                             )
-                                            PdfControlChip(
-                                                label = "View PDF Page",
-                                                highlighted = false,
-                                                onClick = { viewModel.exitTextMode() },
-                                            )
+                                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                                PdfControlChip(
+                                                    label = "View PDF Page",
+                                                    highlighted = false,
+                                                    onClick = { viewModel.exitTextMode() },
+                                                )
+                                                PdfControlChip(
+                                                    label = "Retry Text",
+                                                    highlighted = false,
+                                                    onClick = { viewModel.reextractWithMode(extractionMode) },
+                                                )
+                                            }
                                         }
                                     }
                                 } else {

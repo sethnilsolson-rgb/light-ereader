@@ -5,8 +5,37 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.zip.Inflater
 import kotlin.math.abs
+import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
+
+@Serializable
+enum class PdfExtractionMode(
+    val shortLabel: String,
+    val displayName: String,
+    val description: String,
+) {
+    SMART_LAYOUT(
+        shortLabel = "Smart",
+        displayName = "Smart Layout",
+        description = "Separates boxes, sidebars & columns in reading order",
+    ),
+    SINGLE_COLUMN(
+        shortLabel = "Top-Down",
+        displayName = "Top-to-Bottom",
+        description = "Reads strictly top to bottom across full page width",
+    ),
+    STREAM_ORDER(
+        shortLabel = "Original",
+        displayName = "PDF Stream Order",
+        description = "Follows the PDF's internal text order (fallback)",
+    );
+
+    companion object {
+        fun fromName(name: String?): PdfExtractionMode =
+            entries.firstOrNull { it.name == name } ?: SMART_LAYOUT
+    }
+}
 
 @Serializable
 data class CachedPdfTextBlock(
@@ -24,6 +53,8 @@ data class CachedPdfTextPage(
 data class CachedPdfTextBook(
     val pageCount: Int,
     val pages: List<CachedPdfTextPage>,
+    val extractorVersion: Int = 1,
+    val modeName: String = PdfExtractionMode.SMART_LAYOUT.name,
 )
 
 sealed class PdfTextExtractionResult {
@@ -39,19 +70,24 @@ sealed class PdfTextExtractionResult {
  * Supports:
  * - PDF 1.0–2.0 indirect objects, incremental updates, and PDF 1.5+ compressed `/ObjStm` object streams
  * - `/FlateDecode` (zlib + raw deflate fallback, plus PNG predictors), `/ASCIIHexDecode`, `/ASCII85Decode`
- * - `/Catalog` -> `/Pages` tree traversal with `/Resources` inheritance
+ * - `/Catalog` -> `/Pages` tree traversal with `/Resources` & `/Rotate` inheritance
  * - `/ToUnicode` CMap streams (`codespacerange`, `bfchar`, `bfrange`, 1-byte & 2-byte CID, UTF-16BE, ligatures)
  * - `/WinAnsiEncoding`, `/MacRomanEncoding`, `/StandardEncoding`, and `/Differences` glyph tables
- * - Content stream operators (`BT`, `ET`, `Tf`, `Tm`, `Td`, `TD`, `T*`, `TL`, `Tj`, `TJ`, `'`, `"`, `cm`, `q`, `Q`, `Do` Form XObjects)
- * - Line grouping, de-hyphenation, heading detection, and clean book-style paragraph reflow
+ * - Full 2D affine matrix tracking (`cm`, `q`, `Q`, `Tm`, `Td`, `TD`, `T*`, `TL`, `Tc`, `Tw`, `Tz`, `Ts`,
+ *   `Tj`, `TJ`, `'`, `"`, and Form XObject `/Do` with `/Matrix`), including flipped-Y & rotated pages
+ * - Smart recursive XY-cut layout segmentation for callout boxes, sidebars & multi-column books,
+ *   plus Top-to-Bottom and PDF Stream Order fallback modes
  */
 object PdfTextExtractor {
+
+    const val EXTRACTOR_VERSION = 2
 
     private const val MAX_PDF_BYTES = 120 * 1024 * 1024 // 120 MB safety guard
     private const val MAX_DECOMPRESSED_STREAM_BYTES = 32 * 1024 * 1024
 
     fun extract(
         file: File,
+        mode: PdfExtractionMode = PdfExtractionMode.SMART_LAYOUT,
         onProgress: (currentPage: Int, totalPages: Int) -> Unit = { _, _ -> },
         isCancelled: () -> Boolean = { false },
     ): PdfTextExtractionResult {
@@ -59,11 +95,12 @@ object PdfTextExtractor {
         if (file.length() > MAX_PDF_BYTES) {
             return PdfTextExtractionResult.Error("PDF is too large for on-device text extraction.")
         }
-        return extractBytes(file.readBytes(), onProgress, isCancelled)
+        return extractBytes(file.readBytes(), mode, onProgress, isCancelled)
     }
 
     fun extractBytes(
         bytes: ByteArray,
+        mode: PdfExtractionMode = PdfExtractionMode.SMART_LAYOUT,
         onProgress: (currentPage: Int, totalPages: Int) -> Unit = { _, _ -> },
         isCancelled: () -> Boolean = { false },
     ): PdfTextExtractionResult {
@@ -92,7 +129,7 @@ object PdfTextExtractor {
                     onProgress(idx + 1, total)
                 }
 
-                val blocks = extractPageBlocks(doc, pageNode, fontCache)
+                val blocks = extractPageBlocks(doc, pageNode, fontCache, mode)
                 for (b in blocks) {
                     totalAlphaNumChars += b.text.count { it.isLetterOrDigit() }
                 }
@@ -108,6 +145,8 @@ object PdfTextExtractor {
                 CachedPdfTextBook(
                     pageCount = total,
                     pages = extractedPages,
+                    extractorVersion = EXTRACTOR_VERSION,
+                    modeName = mode.name,
                 )
             )
         } catch (t: Throwable) {
@@ -139,6 +178,7 @@ object PdfTextExtractor {
     private data class PageNode(
         val dict: PdfVal.Dict,
         val inheritedResources: PdfVal.Dict?,
+        val rotationDegrees: Int = 0,
     )
 
     private class PdfDocument(
@@ -190,7 +230,7 @@ object PdfTextExtractor {
             val visited = HashSet<Int>()
 
             if (pagesRoot != null) {
-                walkPagesTree(pagesRoot, null, result, visited)
+                walkPagesTree(pagesRoot, null, 0, result, visited)
             }
 
             // Fallback if catalog/tree is unusual: collect all /Type /Page objects in object-number order
@@ -198,7 +238,8 @@ object PdfTextExtractor {
                 for ((_, v) in objects.entries.sortedBy { it.key }) {
                     val d = v as? PdfVal.Dict ?: continue
                     if ((d["Type"] as? PdfVal.Name)?.name == "Page") {
-                        result.add(PageNode(d, null))
+                        val rot = ((resolveInt(d["Rotate"]) ?: 0) % 360 + 360) % 360
+                        result.add(PageNode(d, null, rot))
                     }
                 }
             }
@@ -208,15 +249,17 @@ object PdfTextExtractor {
         private fun walkPagesTree(
             node: PdfVal.Dict,
             inheritedResources: PdfVal.Dict?,
+            inheritedRotation: Int,
             out: MutableList<PageNode>,
             visited: MutableSet<Int>,
         ) {
             val res = resolveDict(node["Resources"]) ?: inheritedResources
+            val rot = resolveInt(node["Rotate"])?.let { ((it % 360) + 360) % 360 } ?: inheritedRotation
             val typeName = (node["Type"] as? PdfVal.Name)?.name
             val kids = resolve(node["Kids"]) as? PdfVal.Arr
 
             if (typeName == "Page" || (kids == null && node["Contents"] != null)) {
-                out.add(PageNode(node, res))
+                out.add(PageNode(node, res, rot))
                 return
             }
             if (kids == null) return
@@ -226,7 +269,7 @@ object PdfTextExtractor {
                     if (!visited.add(kidRef.objNum)) continue
                 }
                 val kidDict = resolveDict(kidRef) ?: continue
-                walkPagesTree(kidDict, res, out, visited)
+                walkPagesTree(kidDict, res, rot, out, visited)
             }
         }
     }
@@ -1080,38 +1123,95 @@ object PdfTextExtractor {
     }
 
     // -------------------------------------------------------------------------
-    // Content Stream Interpreter & Paragraph Reflow
+    // 2D Affine Matrix, Content Stream Interpreter & Layout Reflow Engine
     // -------------------------------------------------------------------------
+
+    /**
+     * Standard PDF 2D affine transformation matrix in row-vector convention:
+     *   [ a  b  0 ]
+     *   [ c  d  0 ]
+     *   [ e  f  1 ]
+     * Correctly handles translation, scaling, rotation, skew, flipped Y-axes,
+     * and nested Form XObject `/Matrix` transforms.
+     */
+    private data class Matrix2D(
+        val a: Float,
+        val b: Float,
+        val c: Float,
+        val d: Float,
+        val e: Float,
+        val f: Float,
+    ) {
+        fun concat(other: Matrix2D): Matrix2D = Matrix2D(
+            a = a * other.a + b * other.c,
+            b = a * other.b + b * other.d,
+            c = c * other.a + d * other.c,
+            d = c * other.b + d * other.d,
+            e = e * other.a + f * other.c + other.e,
+            f = e * other.b + f * other.d + other.f,
+        )
+
+        fun transformPoint(x: Float, y: Float): Pair<Float, Float> =
+            (a * x + c * y + e) to (b * x + d * y + f)
+
+        fun scaleY(): Float {
+            val sy = hypot(c, d)
+            return if (sy > 0.001f) sy else hypot(a, b).coerceAtLeast(0.001f)
+        }
+
+        companion object {
+            val IDENTITY = Matrix2D(1f, 0f, 0f, 1f, 0f, 0f)
+            fun translate(tx: Float, ty: Float) = Matrix2D(1f, 0f, 0f, 1f, tx, ty)
+        }
+    }
 
     private data class TextRun(
         val text: String,
         val x: Float,
+        val endX: Float,
         val y: Float,
         val fontSize: Float,
+        val streamIndex: Int,
     )
 
     private fun extractPageBlocks(
         doc: PdfDocument,
         pageNode: PageNode,
         fontCache: MutableMap<Int, PdfFontDecoder>,
+        mode: PdfExtractionMode,
     ): List<CachedPdfTextBlock> {
         val resources = doc.resolveDict(pageNode.dict["Resources"]) ?: pageNode.inheritedResources
         val contentStreams = collectContentStreams(doc, pageNode.dict["Contents"])
         if (contentStreams.isEmpty()) return emptyList()
 
-        val runs = ArrayList<TextRun>()
-        for (streamBytes in contentStreams) {
-            interpretContentStream(
-                streamBytes = streamBytes,
-                resources = resources,
-                doc = doc,
-                fontCache = fontCache,
-                outRuns = runs,
-                formDepth = 0,
-            )
+        // Per ISO 32000-1 §7.7.3.3, an array of /Contents streams forms one continuous
+        // logical content stream where graphics state & fonts carry across chunks.
+        val combinedStream = if (contentStreams.size == 1) {
+            contentStreams[0]
+        } else {
+            val out = ByteArrayOutputStream(contentStreams.sumOf { it.size + 1 })
+            for ((idx, chunk) in contentStreams.withIndex()) {
+                if (idx > 0) out.write('\n'.code)
+                out.write(chunk)
+            }
+            out.toByteArray()
         }
 
-        return reflowRunsToBlocks(runs)
+        val runs = ArrayList<TextRun>()
+        val seqCounter = IntArray(1)
+        interpretContentStream(
+            streamBytes = combinedStream,
+            resources = resources,
+            doc = doc,
+            fontCache = fontCache,
+            initialCtm = Matrix2D.IDENTITY,
+            pageRotation = pageNode.rotationDegrees,
+            outRuns = runs,
+            seqCounter = seqCounter,
+            formDepth = 0,
+        )
+
+        return reflowRunsToBlocks(runs, mode)
     }
 
     private fun collectContentStreams(doc: PdfDocument, contentsVal: PdfVal?): List<ByteArray> {
@@ -1122,15 +1222,65 @@ object PdfTextExtractor {
         }
     }
 
+    private fun rotateToVisualCoords(x: Float, y: Float, rotationDegrees: Int): Pair<Float, Float> =
+        when (rotationDegrees) {
+            90 -> y to -x
+            180 -> -x to -y
+            270 -> -y to x
+            else -> x to y
+        }
+
+    private fun estimateTextWidth(
+        text: String,
+        fontSize: Float,
+        charSpacing: Float,
+        wordSpacing: Float,
+        horizScale: Float,
+    ): Float {
+        if (text.isEmpty()) return 0f
+        var width = 0f
+        for (ch in text) {
+            val rel = when (ch) {
+                ' ' -> 0.28f
+                'i', 'l', 'I', '1', '.', ',', ':', ';', '\'', '!', '|' -> 0.28f
+                'f', 'j', 'r', 't', '(', ')', '[', ']', '-', '"' -> 0.36f
+                'm', 'w', 'M', 'W', '—', '–' -> 0.72f
+                in 'A'..'Z' -> 0.58f
+                else -> 0.48f
+            }
+            var advance = fontSize * rel + charSpacing
+            if (ch == ' ') advance += wordSpacing
+            width += advance * horizScale
+        }
+        return width
+    }
+
+    private fun sanitizeExtractedText(raw: String): String {
+        if (raw.isEmpty()) return ""
+        val sb = StringBuilder(raw.length)
+        for (ch in raw) {
+            when {
+                ch == '\u0000' || ch == '\uFFFD' -> Unit
+                ch == '\t' || ch == '\n' || ch == '\r' || ch == '\u00A0' -> sb.append(' ')
+                ch.code < 0x20 -> Unit
+                else -> sb.append(ch)
+            }
+        }
+        return sb.toString()
+    }
+
     private fun interpretContentStream(
         streamBytes: ByteArray,
         resources: PdfVal.Dict?,
         doc: PdfDocument,
         fontCache: MutableMap<Int, PdfFontDecoder>,
+        initialCtm: Matrix2D,
+        pageRotation: Int,
         outRuns: MutableList<TextRun>,
+        seqCounter: IntArray,
         formDepth: Int,
     ) {
-        if (formDepth > 4 || streamBytes.isEmpty()) return
+        if (formDepth > 6 || streamBytes.isEmpty()) return
 
         val fontDict = doc.resolveDict(resources?.get("Font"))
         val xObjectDict = doc.resolveDict(resources?.get("XObject"))
@@ -1145,32 +1295,59 @@ object PdfTextExtractor {
         val scanner = PdfByteScanner(streamBytes)
         val operands = ArrayList<PdfVal>(16)
 
-        // Simple graphics + text state
+        data class GState(
+            val ctm: Matrix2D,
+            val font: PdfFontDecoder,
+            val fontSize: Float,
+            val textLeading: Float,
+            val horizScale: Float,
+            val charSpacing: Float,
+            val wordSpacing: Float,
+            val textRise: Float,
+        )
+
         var inText = false
-        var currentFont: PdfFontDecoder = PdfFontDecoder(null, null, false, WIN_ANSI_TABLE)
+        var ctm = initialCtm
+        var currentFont = PdfFontDecoder(null, null, false, WIN_ANSI_TABLE)
         var fontSize = 11f
         var textLeading = 14f
+        var horizScale = 1f
+        var charSpacing = 0f
+        var wordSpacing = 0f
+        var textRise = 0f
 
-        // Text matrix (tx, ty) and line matrix (lmx, lmy), plus scale
-        var tmScaleY = 1f
-        var tmX = 0f
-        var tmY = 0f
-        var lmX = 0f
-        var lmY = 0f
-
-        // Graphics state stack (ctm translation & scale for simple transforms)
-        data class GState(val sx: Float, val sy: Float, val tx: Float, val ty: Float)
+        var tm = Matrix2D.IDENTITY
+        var lm = Matrix2D.IDENTITY
         val gStack = ArrayDeque<GState>()
-        var ctm = GState(1f, 1f, 0f, 0f)
+
+        fun emitRunAt(str: String, startTm: Matrix2D, textAdvance: Float) {
+            val cleaned = sanitizeExtractedText(str)
+            if (cleaned.isBlank()) return
+            val trm = startTm.concat(ctm)
+            val (rawSx, rawSy) = trm.transformPoint(0f, textRise)
+            val (rawEx, rawEy) = trm.transformPoint(textAdvance, textRise)
+            val (visSx, visSy) = rotateToVisualCoords(rawSx, rawSy, pageRotation)
+            val (visEx, _) = rotateToVisualCoords(rawEx, rawEy, pageRotation)
+            val effSize = abs(fontSize * trm.scaleY()).coerceIn(4f, 96f)
+            val xMin = min(visSx, visEx)
+            val xMax = max(visSx, visEx).coerceAtLeast(xMin + effSize * 0.25f)
+            outRuns.add(
+                TextRun(
+                    text = cleaned,
+                    x = xMin,
+                    endX = xMax,
+                    y = visSy,
+                    fontSize = effSize,
+                    streamIndex = seqCounter[0]++,
+                )
+            )
+        }
 
         fun emitText(str: String) {
             if (str.isEmpty()) return
-            val worldX = tmX * ctm.sx + ctm.tx
-            val worldY = tmY * ctm.sy + ctm.ty
-            val effSize = abs(fontSize * tmScaleY * ctm.sy).coerceIn(4f, 96f)
-            outRuns.add(TextRun(str, worldX, worldY, effSize))
-            // Advance approximate cursor X so consecutive Tj calls on the same line maintain order
-            tmX += str.length * effSize * 0.45f
+            val adv = estimateTextWidth(str, fontSize, charSpacing, wordSpacing, horizScale)
+            emitRunAt(str, tm, adv)
+            tm = Matrix2D.translate(adv, 0f).concat(tm)
         }
 
         var pos = 0
@@ -1217,78 +1394,101 @@ object PdfTextExtractor {
                     pos = end
 
                     when (op) {
-                        "q" -> gStack.addLast(ctm)
-                        "Q" -> if (gStack.isNotEmpty()) ctm = gStack.removeLast()
+                        "q" -> gStack.addLast(
+                            GState(ctm, currentFont, fontSize, textLeading, horizScale, charSpacing, wordSpacing, textRise)
+                        )
+                        "Q" -> if (gStack.isNotEmpty()) {
+                            val prev = gStack.removeLast()
+                            ctm = prev.ctm
+                            currentFont = prev.font
+                            fontSize = prev.fontSize
+                            textLeading = prev.textLeading
+                            horizScale = prev.horizScale
+                            charSpacing = prev.charSpacing
+                            wordSpacing = prev.wordSpacing
+                            textRise = prev.textRise
+                        }
                         "cm" -> if (operands.size >= 6) {
                             val a = (operands[operands.size - 6] as? PdfVal.Num)?.asFloat ?: 1f
+                            val bM = (operands[operands.size - 5] as? PdfVal.Num)?.asFloat ?: 0f
+                            val cM = (operands[operands.size - 4] as? PdfVal.Num)?.asFloat ?: 0f
                             val d = (operands[operands.size - 3] as? PdfVal.Num)?.asFloat ?: 1f
                             val e = (operands[operands.size - 2] as? PdfVal.Num)?.asFloat ?: 0f
                             val f = (operands[operands.size - 1] as? PdfVal.Num)?.asFloat ?: 0f
-                            ctm = GState(
-                                sx = ctm.sx * (if (abs(a) > 0.001f) a else 1f),
-                                sy = ctm.sy * (if (abs(d) > 0.001f) d else 1f),
-                                tx = ctm.tx + e * ctm.sx,
-                                ty = ctm.ty + f * ctm.sy,
-                            )
+                            ctm = Matrix2D(a, bM, cM, d, e, f).concat(ctm)
                         }
                         "BT" -> {
                             inText = true
-                            tmScaleY = 1f
-                            tmX = 0f; tmY = 0f
-                            lmX = 0f; lmY = 0f
+                            tm = Matrix2D.IDENTITY
+                            lm = Matrix2D.IDENTITY
                         }
                         "ET" -> inText = false
                         "Tf" -> if (operands.size >= 2) {
                             val fName = (operands[operands.size - 2] as? PdfVal.Name)?.name
                             val fSize = (operands[operands.size - 1] as? PdfVal.Num)?.asFloat
                             if (fName != null) currentFont = fontFor(fName)
-                            if (fSize != null && abs(fSize) > 0.1f) fontSize = abs(fSize)
+                            if (fSize != null && abs(fSize) > 0.01f) fontSize = abs(fSize)
                         }
                         "TL" -> if (operands.isNotEmpty()) {
                             textLeading = (operands.last() as? PdfVal.Num)?.asFloat ?: textLeading
                         }
+                        "Tz" -> if (operands.isNotEmpty()) {
+                            val pct = (operands.last() as? PdfVal.Num)?.asFloat ?: 100f
+                            if (abs(pct) > 1f) horizScale = (pct / 100f).coerceIn(0.1f, 10f)
+                        }
+                        "Tc" -> if (operands.isNotEmpty()) {
+                            charSpacing = (operands.last() as? PdfVal.Num)?.asFloat ?: 0f
+                        }
+                        "Tw" -> if (operands.isNotEmpty()) {
+                            wordSpacing = (operands.last() as? PdfVal.Num)?.asFloat ?: 0f
+                        }
+                        "Ts" -> if (operands.isNotEmpty()) {
+                            textRise = (operands.last() as? PdfVal.Num)?.asFloat ?: 0f
+                        }
                         "Tm" -> if (operands.size >= 6) {
                             val a = (operands[operands.size - 6] as? PdfVal.Num)?.asFloat ?: 1f
                             val bM = (operands[operands.size - 5] as? PdfVal.Num)?.asFloat ?: 0f
+                            val cM = (operands[operands.size - 4] as? PdfVal.Num)?.asFloat ?: 0f
                             val d = (operands[operands.size - 3] as? PdfVal.Num)?.asFloat ?: 1f
                             val e = (operands[operands.size - 2] as? PdfVal.Num)?.asFloat ?: 0f
                             val f = (operands[operands.size - 1] as? PdfVal.Num)?.asFloat ?: 0f
-                            tmScaleY = max(abs(d), max(abs(a), abs(bM))).takeIf { it > 0.01f } ?: 1f
-                            tmX = e; tmY = f
-                            lmX = e; lmY = f
+                            tm = Matrix2D(a, bM, cM, d, e, f)
+                            lm = tm
                         }
                         "Td" -> if (operands.size >= 2) {
                             val tx = (operands[operands.size - 2] as? PdfVal.Num)?.asFloat ?: 0f
                             val ty = (operands[operands.size - 1] as? PdfVal.Num)?.asFloat ?: 0f
-                            lmX += tx * tmScaleY
-                            lmY += ty * tmScaleY
-                            tmX = lmX; tmY = lmY
+                            lm = Matrix2D.translate(tx, ty).concat(lm)
+                            tm = lm
                         }
                         "TD" -> if (operands.size >= 2) {
                             val tx = (operands[operands.size - 2] as? PdfVal.Num)?.asFloat ?: 0f
                             val ty = (operands[operands.size - 1] as? PdfVal.Num)?.asFloat ?: 0f
                             textLeading = -ty
-                            lmX += tx * tmScaleY
-                            lmY += ty * tmScaleY
-                            tmX = lmX; tmY = lmY
+                            lm = Matrix2D.translate(tx, ty).concat(lm)
+                            tm = lm
                         }
                         "T*" -> {
-                            lmY -= textLeading * tmScaleY
-                            tmX = lmX; tmY = lmY
+                            lm = Matrix2D.translate(0f, -textLeading).concat(lm)
+                            tm = lm
                         }
                         "Tj" -> if (inText && operands.isNotEmpty()) {
                             val s = operands.last() as? PdfVal.Str
                             if (s != null) emitText(currentFont.decode(s.bytes))
                         }
                         "'" -> if (inText && operands.isNotEmpty()) {
-                            lmY -= textLeading * tmScaleY
-                            tmX = lmX; tmY = lmY
+                            lm = Matrix2D.translate(0f, -textLeading).concat(lm)
+                            tm = lm
                             val s = operands.last() as? PdfVal.Str
                             if (s != null) emitText(currentFont.decode(s.bytes))
                         }
                         "\"" -> if (inText && operands.isNotEmpty()) {
-                            lmY -= textLeading * tmScaleY
-                            tmX = lmX; tmY = lmY
+                            if (operands.size >= 3) {
+                                wordSpacing = (operands[operands.size - 3] as? PdfVal.Num)?.asFloat ?: wordSpacing
+                                charSpacing = (operands[operands.size - 2] as? PdfVal.Num)?.asFloat ?: charSpacing
+                            }
+                            lm = Matrix2D.translate(0f, -textLeading).concat(lm)
+                            tm = lm
                             val s = operands.last() as? PdfVal.Str
                             if (s != null) emitText(currentFont.decode(s.bytes))
                         }
@@ -1296,19 +1496,49 @@ object PdfTextExtractor {
                             val arr = operands.last() as? PdfVal.Arr
                             if (arr != null) {
                                 val sb = StringBuilder()
+                                var segStartTm = tm
+                                var segAdvance = 0f
+
+                                fun flushSegment() {
+                                    if (sb.isNotEmpty()) {
+                                        emitRunAt(sb.toString(), segStartTm, segAdvance)
+                                        sb.clear()
+                                    }
+                                    tm = Matrix2D.translate(segAdvance, 0f).concat(segStartTm)
+                                    segStartTm = tm
+                                    segAdvance = 0f
+                                }
+
                                 for (item in arr.items) {
                                     when (item) {
-                                        is PdfVal.Str -> sb.append(currentFont.decode(item.bytes))
+                                        is PdfVal.Str -> {
+                                            val decoded = currentFont.decode(item.bytes)
+                                            if (decoded.isNotEmpty()) {
+                                                sb.append(decoded)
+                                                segAdvance += estimateTextWidth(
+                                                    decoded, fontSize, charSpacing, wordSpacing, horizScale
+                                                )
+                                            }
+                                        }
                                         is PdfVal.Num -> {
-                                            // Negative TJ displacement advances rightward; < -160 ≈ word space
-                                            if (item.value < -160.0 && sb.isNotEmpty() && sb.last() != ' ') {
-                                                sb.append(' ')
+                                            val disp = (-item.value.toFloat() / 1000f) * fontSize * horizScale
+                                            // Large horizontal jump (> 1.4 ems) indicates a column gutter,
+                                            // table cell, or reposition — split into separate positioned runs
+                                            if (abs(item.value) > 1400.0) {
+                                                flushSegment()
+                                                tm = Matrix2D.translate(disp, 0f).concat(tm)
+                                                segStartTm = tm
+                                            } else {
+                                                if (item.value < -180.0 && sb.isNotEmpty() && !sb.last().isWhitespace()) {
+                                                    sb.append(' ')
+                                                }
+                                                segAdvance += disp
                                             }
                                         }
                                         else -> Unit
                                     }
                                 }
-                                emitText(sb.toString())
+                                flushSegment()
                             }
                         }
                         "Do" -> if (operands.isNotEmpty()) {
@@ -1318,13 +1548,18 @@ object PdfTextExtractor {
                                 if (xObj != null && (xObj.dict["Subtype"] as? PdfVal.Name)?.name == "Form") {
                                     val formBytes = decodeStream(xObj.rawBytes, xObj.dict, doc)
                                     val formRes = doc.resolveDict(xObj.dict["Resources"]) ?: resources
+                                    val formMatrix = parseMatrixArray(doc, xObj.dict["Matrix"])
+                                    val formCtm = formMatrix.concat(ctm)
                                     if (formBytes != null) {
                                         interpretContentStream(
                                             streamBytes = formBytes,
                                             resources = formRes,
                                             doc = doc,
                                             fontCache = fontCache,
+                                            initialCtm = formCtm,
+                                            pageRotation = pageRotation,
                                             outRuns = outRuns,
+                                            seqCounter = seqCounter,
                                             formDepth = formDepth + 1,
                                         )
                                     }
@@ -1338,86 +1573,413 @@ object PdfTextExtractor {
         }
     }
 
+    private fun parseMatrixArray(doc: PdfDocument, value: PdfVal?): Matrix2D {
+        val arr = doc.resolve(value) as? PdfVal.Arr ?: return Matrix2D.IDENTITY
+        if (arr.items.size < 6) return Matrix2D.IDENTITY
+        val nums = arr.items.take(6).map { (doc.resolve(it) as? PdfVal.Num)?.asFloat ?: return Matrix2D.IDENTITY }
+        return Matrix2D(nums[0], nums[1], nums[2], nums[3], nums[4], nums[5])
+    }
+
     private data class VisualLine(
         val y: Float,
         val minX: Float,
+        val maxX: Float,
         val fontSize: Float,
         val text: String,
     )
 
-    private fun reflowRunsToBlocks(runs: List<TextRun>): List<CachedPdfTextBlock> {
+    private fun deduplicateFauxBoldRuns(runs: List<TextRun>): List<TextRun> {
+        if (runs.size <= 1) return runs
+        val out = ArrayList<TextRun>(runs.size)
+        for (run in runs) {
+            val trimmed = run.text.trim()
+            if (trimmed.isEmpty()) continue
+            val isDuplicate = out.asReversed().take(6).any { prev ->
+                prev.text.trim() == trimmed &&
+                    abs(prev.x - run.x) <= 1.2f &&
+                    abs(prev.y - run.y) <= 1.2f
+            }
+            if (!isDuplicate) out.add(run)
+        }
+        return out
+    }
+
+    private fun reflowRunsToBlocks(
+        rawRuns: List<TextRun>,
+        mode: PdfExtractionMode,
+    ): List<CachedPdfTextBlock> {
+        val runs = deduplicateFauxBoldRuns(rawRuns)
         if (runs.isEmpty()) return emptyList()
 
-        // 1. Group runs into horizontal lines by Y coordinate (PDF Y grows upward)
-        val sortedByY = runs.sortedWith(compareByDescending<TextRun> { it.y }.thenBy { it.x })
-        val lineBuckets = ArrayList<MutableList<TextRun>>()
+        val sortedSizes = runs.map { it.fontSize }.sorted()
+        val pageBodyFontSize = sortedSizes[sortedSizes.size / 2]
 
+        return when (mode) {
+            PdfExtractionMode.STREAM_ORDER -> reflowStreamOrder(runs, pageBodyFontSize)
+            PdfExtractionMode.SINGLE_COLUMN -> reflowSingleColumn(runs, pageBodyFontSize)
+            PdfExtractionMode.SMART_LAYOUT -> reflowSmartLayout(runs, pageBodyFontSize)
+        }
+    }
+
+    private fun joinRunsToLineText(bucket: List<TextRun>): String {
+        val sb = StringBuilder()
+        var prevEndX = Float.NaN
+        var prevSize = bucket.first().fontSize
+        for (r in bucket) {
+            val t = r.text
+            if (sb.isNotEmpty() && !prevEndX.isNaN()) {
+                val gap = r.x - prevEndX
+                val needsSpace = gap > prevSize * 0.16f &&
+                    !sb.last().isWhitespace() &&
+                    !t.first().isWhitespace()
+                if (needsSpace) sb.append(' ')
+            }
+            sb.append(t)
+            prevEndX = max(prevEndX.takeIf { !it.isNaN() } ?: r.endX, r.endX)
+            prevSize = r.fontSize
+        }
+        return sb.toString().replace(Regex("[ \\t\\u00A0]+"), " ").trim()
+    }
+
+    private fun reflowStreamOrder(
+        runs: List<TextRun>,
+        pageBodyFontSize: Float,
+    ): List<CachedPdfTextBlock> {
+        val ordered = runs.sortedBy { it.streamIndex }
+        val lines = ArrayList<VisualLine>()
+        val curBucket = ArrayList<TextRun>()
+
+        fun flushBucket() {
+            if (curBucket.isEmpty()) return
+            val txt = joinRunsToLineText(curBucket)
+            if (txt.isNotEmpty()) {
+                val medianSize = curBucket.map { it.fontSize }.sorted()[curBucket.size / 2]
+                lines.add(
+                    VisualLine(
+                        y = curBucket.first().y,
+                        minX = curBucket.minOf { it.x },
+                        maxX = curBucket.maxOf { it.endX },
+                        fontSize = medianSize,
+                        text = txt,
+                    )
+                )
+            }
+            curBucket.clear()
+        }
+
+        for (run in ordered) {
+            if (curBucket.isEmpty()) {
+                curBucket.add(run)
+                continue
+            }
+            val first = curBucket.first()
+            val last = curBucket.last()
+            val tolY = max(2.5f, min(first.fontSize, run.fontSize) * 0.45f)
+            val sameLine = abs(first.y - run.y) <= tolY && run.x >= last.x - run.fontSize * 0.5f
+            if (sameLine) {
+                curBucket.add(run)
+            } else {
+                flushBucket()
+                curBucket.add(run)
+            }
+        }
+        flushBucket()
+        return mergeLinesToBlocks(lines, pageBodyFontSize, checkVerticalGaps = true)
+    }
+
+    private fun reflowSingleColumn(
+        runs: List<TextRun>,
+        pageBodyFontSize: Float,
+    ): List<CachedPdfTextBlock> {
+        val sortedByY = runs.sortedWith(
+            compareByDescending<TextRun> { it.y }
+                .thenBy { it.x }
+                .thenBy { it.streamIndex }
+        )
+        val lineBuckets = ArrayList<MutableList<TextRun>>()
         for (run in sortedByY) {
-            val cleaned = run.text.replace('\u0000', ' ')
-            if (cleaned.isBlank()) continue
             val existing = lineBuckets.firstOrNull { bucket ->
                 val refY = bucket.first().y
-                val tol = max(2.5f, min(bucket.first().fontSize, run.fontSize) * 0.4f)
+                val tol = max(2.5f, min(bucket.first().fontSize, run.fontSize) * 0.45f)
                 abs(refY - run.y) <= tol
             }
-            if (existing != null) {
-                existing.add(run.copy(text = cleaned))
-            } else {
-                lineBuckets.add(mutableListOf(run.copy(text = cleaned)))
-            }
+            if (existing != null) existing.add(run) else lineBuckets.add(mutableListOf(run))
         }
 
         val lines = lineBuckets.mapNotNull { bucket ->
-            bucket.sortBy { it.x }
-            val sb = StringBuilder()
-            var prevEndX = Float.NaN
-            var prevSize = bucket.first().fontSize
-            for (r in bucket) {
-                val t = r.text
-                if (sb.isNotEmpty() && !prevEndX.isNaN()) {
-                    val gap = r.x - prevEndX
-                    val needsSpace = gap > prevSize * 0.18f &&
-                        !sb.last().isWhitespace() &&
-                        !t.first().isWhitespace()
-                    if (needsSpace) sb.append(' ')
-                }
-                sb.append(t)
-                prevEndX = r.x + t.length * r.fontSize * 0.45f
-                prevSize = r.fontSize
-            }
-            val lineText = sb.toString().replace(Regex("[ \\t\\u00A0]+"), " ").trim()
-            if (lineText.isEmpty()) null else VisualLine(
+            bucket.sortWith(compareBy<TextRun> { it.x }.thenBy { it.streamIndex })
+            val txt = joinRunsToLineText(bucket)
+            if (txt.isEmpty()) null else VisualLine(
                 y = bucket.first().y,
                 minX = bucket.first().x,
+                maxX = bucket.maxOf { it.endX },
                 fontSize = bucket.map { it.fontSize }.sorted()[bucket.size / 2],
-                text = lineText,
+                text = txt,
             )
         }.sortedByDescending { it.y }
 
-        if (lines.isEmpty()) return emptyList()
+        return mergeLinesToBlocks(lines, pageBodyFontSize, checkVerticalGaps = true)
+    }
 
-        // 2. Estimate page body font size, left margin, and typical line spacing
-        val sortedSizes = lines.map { it.fontSize }.sorted()
-        val bodyFontSize = sortedSizes[sortedSizes.size / 2]
+    private fun reflowSmartLayout(
+        runs: List<TextRun>,
+        pageBodyFontSize: Float,
+    ): List<CachedPdfTextBlock> {
+        // 1. Group runs by Y coordinate, then split wide horizontal gaps into separate LineSegments
+        //    so side-by-side columns, callout boxes, and sidebars stay completely un-interleaved.
+        val sortedByY = runs.sortedWith(
+            compareByDescending<TextRun> { it.y }
+                .thenBy { it.x }
+                .thenBy { it.streamIndex }
+        )
+        val yBuckets = ArrayList<MutableList<TextRun>>()
+        for (run in sortedByY) {
+            val existing = yBuckets.firstOrNull { bucket ->
+                val refY = bucket.first().y
+                val tol = max(2.5f, min(bucket.first().fontSize, run.fontSize) * 0.45f)
+                abs(refY - run.y) <= tol
+            }
+            if (existing != null) existing.add(run) else yBuckets.add(mutableListOf(run))
+        }
+
+        val segments = ArrayList<VisualLine>()
+        for (bucket in yBuckets) {
+            bucket.sortWith(compareBy<TextRun> { it.x }.thenBy { it.streamIndex })
+            val cur = ArrayList<TextRun>()
+
+            fun flushSeg() {
+                if (cur.isEmpty()) return
+                val txt = joinRunsToLineText(cur)
+                if (txt.isNotEmpty()) {
+                    segments.add(
+                        VisualLine(
+                            y = cur.first().y,
+                            minX = cur.minOf { it.x },
+                            maxX = cur.maxOf { it.endX },
+                            fontSize = cur.map { it.fontSize }.sorted()[cur.size / 2],
+                            text = txt,
+                        )
+                    )
+                }
+                cur.clear()
+            }
+
+            var prevEndX = Float.NaN
+            var prevSize = bucket.first().fontSize
+            for (r in bucket) {
+                if (cur.isNotEmpty() && !prevEndX.isNaN()) {
+                    val gap = r.x - prevEndX
+                    val splitThreshold = max(prevSize * 2.4f, 22f)
+                    if (gap > splitThreshold) {
+                        flushSeg()
+                    }
+                }
+                cur.add(r)
+                prevEndX = max(prevEndX.takeIf { !it.isNaN() } ?: r.endX, r.endX)
+                prevSize = r.fontSize
+            }
+            flushSeg()
+        }
+
+        if (segments.isEmpty()) return emptyList()
+
+        // 2. Recursively segment into reading-order regions (XY-Cut: columns, callout boxes, bands)
+        val regions = segmentRegions(segments, pageBodyFontSize, depth = 0)
+
+        // 3. Reflow each region independently so adjacent boxes/columns never merge mid-paragraph
+        val allBlocks = ArrayList<CachedPdfTextBlock>()
+        for (region in regions) {
+            val mergedLines = mergeSameYSegments(region)
+            allBlocks.addAll(mergeLinesToBlocks(mergedLines, pageBodyFontSize, checkVerticalGaps = true))
+        }
+        return allBlocks
+    }
+
+    private fun mergeSameYSegments(region: List<VisualLine>): List<VisualLine> {
+        if (region.size <= 1) return region
+        val sorted = region.sortedWith(compareByDescending<VisualLine> { it.y }.thenBy { it.minX })
+        val out = ArrayList<VisualLine>()
+        var current = sorted.first()
+        for (i in 1 until sorted.size) {
+            val next = sorted[i]
+            val tolY = max(2.5f, min(current.fontSize, next.fontSize) * 0.45f)
+            if (abs(current.y - next.y) <= tolY) {
+                current = VisualLine(
+                    y = current.y,
+                    minX = min(current.minX, next.minX),
+                    maxX = max(current.maxX, next.maxX),
+                    fontSize = max(current.fontSize, next.fontSize),
+                    text = "${current.text} ${next.text}".replace(Regex("\\s+"), " ").trim(),
+                )
+            } else {
+                out.add(current)
+                current = next
+            }
+        }
+        out.add(current)
+        return out
+    }
+
+    /**
+     * Recursive XY-Cut layout analyzer:
+     * 1. Tries a clean full-height vertical gutter split (e.g. 2 columns or body + sidebar box).
+     * 2. Otherwise tries a clean horizontal whitespace band split (isolating headers, footers, or stacked boxes).
+     * 3. If a single full-width heading/footer spans across columns without a huge vertical gap,
+     *    peels off the spanning line(s) at the top or bottom and retries the vertical column split!
+     */
+    private fun segmentRegions(
+        segments: List<VisualLine>,
+        bodyFontSize: Float,
+        depth: Int,
+    ): List<List<VisualLine>> {
+        if (segments.size <= 3 || depth >= 6) return listOf(segments)
+
+        // 1. Clean full-height vertical gutter cut (left region completely before right region)
+        val xCut = findBestVerticalGutter(segments, bodyFontSize)
+        if (xCut != null) {
+            val left = segments.filter { it.maxX <= xCut + 1f }
+            val right = segments.filter { it.minX >= xCut - 1f }
+            if (left.isNotEmpty() && right.isNotEmpty() && left.size + right.size == segments.size) {
+                return segmentRegions(left, bodyFontSize, depth + 1) +
+                    segmentRegions(right, bodyFontSize, depth + 1)
+            }
+        }
+
+        // 2. Clean horizontal band cut on large whitespace gaps (separates full-width titles/boxes)
+        val byY = segments.sortedWith(compareByDescending<VisualLine> { it.y }.thenBy { it.minX })
+        val yBandThreshold = max(bodyFontSize * 2.4f, 26f)
+        var bestYCutIdx = -1
+        var bestYGap = 0f
+        for (i in 1 until byY.size) {
+            val gap = byY[i - 1].y - byY[i].y
+            if (gap > yBandThreshold && gap > bestYGap) {
+                bestYGap = gap
+                bestYCutIdx = i
+            }
+        }
+        if (bestYCutIdx > 0) {
+            val top = byY.subList(0, bestYCutIdx)
+            val bottom = byY.subList(bestYCutIdx, byY.size)
+            // Only split horizontally if at least one half gains a column/box split or it cleanly separates bands
+            val topHasCols = findBestVerticalGutter(top, bodyFontSize) != null
+            val bottomHasCols = findBestVerticalGutter(bottom, bodyFontSize) != null
+            if (topHasCols || bottomHasCols) {
+                return segmentRegions(top, bodyFontSize, depth + 1) +
+                    segmentRegions(bottom, bodyFontSize, depth + 1)
+            }
+        }
+
+        // 3. Peel off wide spanning lines at top/bottom (e.g. tight title directly above 2 columns)
+        val regionMinX = segments.minOf { it.minX }
+        val regionMaxX = segments.maxOf { it.maxX }
+        val regionWidth = regionMaxX - regionMinX
+        if (regionWidth > bodyFontSize * 12f) {
+            val midX = (regionMinX + regionMaxX) / 2f
+            val firstNonSpan = byY.indexOfFirst { !(it.minX < midX && it.maxX > midX && (it.maxX - it.minX) > regionWidth * 0.6f) }
+            if (firstNonSpan in 1 until (byY.size - 3)) {
+                val topSpan = byY.subList(0, firstNonSpan)
+                val rest = byY.subList(firstNonSpan, byY.size)
+                if (findBestVerticalGutter(rest, bodyFontSize) != null) {
+                    return listOf(topSpan) + segmentRegions(rest, bodyFontSize, depth + 1)
+                }
+            }
+            val lastNonSpan = byY.indexOfLast { !(it.minX < midX && it.maxX > midX && (it.maxX - it.minX) > regionWidth * 0.6f) }
+            if (lastNonSpan in 3 until (byY.size - 1)) {
+                val mainPart = byY.subList(0, lastNonSpan + 1)
+                val bottomSpan = byY.subList(lastNonSpan + 1, byY.size)
+                if (findBestVerticalGutter(mainPart, bodyFontSize) != null) {
+                    return segmentRegions(mainPart, bodyFontSize, depth + 1) + listOf(bottomSpan)
+                }
+            }
+        }
+
+        return listOf(segments)
+    }
+
+    private fun findBestVerticalGutter(
+        segments: List<VisualLine>,
+        bodyFontSize: Float,
+    ): Float? {
+        if (segments.size < 4) return null
+        val minGutterWidth = max(bodyFontSize * 1.4f, 14f)
+
+        // Sort unique candidate left boundaries by xEnd
+        val sortedByEnd = segments.sortedBy { it.maxX }
+        var bestMid: Float? = null
+        var bestWidth = 0f
+
+        for (i in 0 until sortedByEnd.size - 1) {
+            val gapLeft = sortedByEnd[i].maxX
+            // Find the leftmost segment starting strictly to the right of gapLeft
+            var gapRight = Float.POSITIVE_INFINITY
+            var leftCount = 0
+            var rightCount = 0
+            var crossed = false
+            var leftMinY = Float.POSITIVE_INFINITY
+            var leftMaxY = Float.NEGATIVE_INFINITY
+            var rightMinY = Float.POSITIVE_INFINITY
+            var rightMaxY = Float.NEGATIVE_INFINITY
+
+            for (seg in segments) {
+                when {
+                    seg.maxX <= gapLeft + 0.5f -> {
+                        leftCount++
+                        if (seg.y < leftMinY) leftMinY = seg.y
+                        if (seg.y > leftMaxY) leftMaxY = seg.y
+                    }
+                    seg.minX > gapLeft -> {
+                        rightCount++
+                        if (seg.minX < gapRight) gapRight = seg.minX
+                        if (seg.y < rightMinY) rightMinY = seg.y
+                        if (seg.y > rightMaxY) rightMaxY = seg.y
+                    }
+                    else -> {
+                        crossed = true
+                        break
+                    }
+                }
+            }
+            if (crossed || leftCount < 2 || rightCount < 2 || !gapRight.isFinite()) continue
+
+            val gutterWidth = gapRight - gapLeft
+            if (gutterWidth < minGutterWidth) continue
+
+            // Ensure left and right actually overlap vertically (side-by-side columns/boxes)
+            val verticalOverlap = min(leftMaxY, rightMaxY) >= max(leftMinY, rightMinY) - bodyFontSize
+            if (!verticalOverlap) continue
+
+            if (gutterWidth > bestWidth) {
+                bestWidth = gutterWidth
+                bestMid = (gapLeft + gapRight) / 2f
+            }
+        }
+        return bestMid
+    }
+
+    private fun mergeLinesToBlocks(
+        lines: List<VisualLine>,
+        pageBodyFontSize: Float,
+        checkVerticalGaps: Boolean,
+    ): List<CachedPdfTextBlock> {
+        if (lines.isEmpty()) return emptyList()
 
         val bodyLineGaps = (1 until lines.size)
             .filter { i ->
-                abs(lines[i - 1].fontSize - bodyFontSize) <= 1.5f &&
-                    abs(lines[i].fontSize - bodyFontSize) <= 1.5f
+                abs(lines[i - 1].fontSize - pageBodyFontSize) <= 1.5f &&
+                    abs(lines[i].fontSize - pageBodyFontSize) <= 1.5f
             }
             .map { lines[it - 1].y - lines[it].y }
-            .filter { it > bodyFontSize * 0.75f && it < bodyFontSize * 2.15f }
+            .filter { it > pageBodyFontSize * 0.75f && it < pageBodyFontSize * 2.15f }
             .sorted()
         val normalLineSpacing = if (bodyLineGaps.isNotEmpty()) {
             bodyLineGaps[bodyLineGaps.size / 3]
         } else {
-            bodyFontSize * 1.35f
+            pageBodyFontSize * 1.35f
         }
 
-        val bodyLeftMargins = lines.filter { abs(it.fontSize - bodyFontSize) <= 1.5f }.map { it.minX }.sorted()
+        val bodyLeftMargins = lines.filter { abs(it.fontSize - pageBodyFontSize) <= 1.5f }.map { it.minX }.sorted()
         val typicalLeftMargin = if (bodyLeftMargins.isNotEmpty()) bodyLeftMargins[bodyLeftMargins.size / 4] else 0f
 
-        // 3. Merge lines into clean book paragraphs & headings
         val blocks = ArrayList<CachedPdfTextBlock>()
         val paraBuf = StringBuilder()
         var currentIsHeading = false
@@ -1432,7 +1994,7 @@ object PdfTextExtractor {
         }
 
         for ((idx, line) in lines.withIndex()) {
-            val isHeadingLine = line.fontSize >= bodyFontSize * 1.22f && line.text.length <= 120
+            val isHeadingLine = line.fontSize >= pageBodyFontSize * 1.22f && line.text.length <= 120
             if (idx == 0) {
                 currentIsHeading = isHeadingLine
                 paraBuf.append(line.text)
@@ -1441,13 +2003,14 @@ object PdfTextExtractor {
 
             val prev = lines[idx - 1]
             val dy = prev.y - line.y
-            val largeVerticalGap = dy > normalLineSpacing * 1.48f
+            val largeVerticalGap = checkVerticalGaps && (dy > normalLineSpacing * 1.48f || dy < -pageBodyFontSize * 0.6f)
             val isIndentedNewPara = !isHeadingLine &&
-                line.minX > typicalLeftMargin + bodyFontSize * 0.9f &&
+                line.minX > typicalLeftMargin + pageBodyFontSize * 0.9f &&
                 (prev.text.endsWith(".") || prev.text.endsWith("?") || prev.text.endsWith("!") ||
                     prev.text.endsWith("\"") || prev.text.endsWith("”") || prev.text.endsWith("’"))
             val styleChanged = isHeadingLine != currentIsHeading
             val bulletStart = line.text.startsWith("•") || line.text.startsWith("- ") ||
+                line.text.startsWith("▪") || line.text.startsWith("– ") ||
                 Regex("""^\d+[.)]\s+""").containsMatchIn(line.text)
 
             if (largeVerticalGap || isIndentedNewPara || styleChanged || bulletStart) {
