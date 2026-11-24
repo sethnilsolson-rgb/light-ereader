@@ -101,6 +101,7 @@ class BookmarksScreen(
                     bookId = bookmark.bookId,
                     bookTitle = bookmark.bookTitle,
                     initialPage = bookmark.positionIndex,
+                    initialScrollPermille = bookmark.scrollPermille,
                 )
             })
         } else {

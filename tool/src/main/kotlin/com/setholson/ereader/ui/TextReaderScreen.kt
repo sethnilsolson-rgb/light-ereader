@@ -31,6 +31,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -39,11 +40,15 @@ import androidx.compose.ui.graphics.vector.rememberVectorPainter
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.layout.positionInParent
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewModelScope
@@ -54,6 +59,7 @@ import com.setholson.ereader.model.BookChapter
 import com.setholson.ereader.model.BookFormat
 import com.setholson.ereader.model.ParsedBook
 import com.setholson.ereader.model.ReaderFontSize
+import com.setholson.ereader.model.ReaderPageMode
 import com.setholson.ereader.model.ReaderProgressMode
 import com.setholson.ereader.model.WordLookupResult
 import com.thelightphone.sdk.LightScreen
@@ -87,7 +93,7 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 
 private const val BRIEF_SCROLL_MEMORY_MS = 180_000L // 3 minutes for flip-back comparisons
-private const val BOOKMARK_PROXIMITY_PERMILLE = 55  // ~5.5% of chapter height
+internal const val BOOKMARK_PROXIMITY_PERMILLE = 55  // ~5.5% of chapter/page height
 
 class TextReaderViewModel(
     private val bookId: String,
@@ -121,6 +127,12 @@ class TextReaderViewModel(
     private val _fontSize = MutableStateFlow(ReaderFontSize.REGULAR)
     val fontSize: StateFlow<ReaderFontSize> = _fontSize.asStateFlow()
 
+    private val _pageMode = MutableStateFlow(ReaderPageMode.SCROLL)
+    val pageMode: StateFlow<ReaderPageMode> = _pageMode.asStateFlow()
+
+    private val _isFullScreen = MutableStateFlow(false)
+    val isFullScreen: StateFlow<Boolean> = _isFullScreen.asStateFlow()
+
     private val _progressMode = MutableStateFlow(ReaderProgressMode.BOOK)
     val progressMode: StateFlow<ReaderProgressMode> = _progressMode.asStateFlow()
 
@@ -145,6 +157,7 @@ class TextReaderViewModel(
         super.onScreenShow(screen)
         viewModelScope.launch {
             _fontSize.value = repository.getFontSizeSync()
+            _pageMode.value = repository.getPageModeSync()
             _progressMode.value = repository.getProgressModeSync()
             _lookupEnabled.value = repository.isAnyDictionaryReadySync()
         }
@@ -244,16 +257,22 @@ class TextReaderViewModel(
         }
     }
 
-    fun nextChapter() {
+    fun nextChapter(landOnStart: Boolean = false) {
         val parsed = _book.value ?: return
         if (_chapterIndex.value < parsed.chapters.lastIndex) {
-            openChapter(_chapterIndex.value + 1)
+            openChapter(
+                index = _chapterIndex.value + 1,
+                explicitScrollPermille = if (landOnStart) 0 else null,
+            )
         }
     }
 
-    fun previousChapter() {
+    fun previousChapter(landOnEnd: Boolean = false) {
         if (_chapterIndex.value > 0) {
-            openChapter(_chapterIndex.value - 1)
+            openChapter(
+                index = _chapterIndex.value - 1,
+                explicitScrollPermille = if (landOnEnd) 1000 else null,
+            )
         }
     }
 
@@ -285,15 +304,36 @@ class TextReaderViewModel(
         }
     }
 
-    fun cycleFontSize() {
+    fun cycleFontSize(preservePermille: Int = liveScrollPermille) {
+        val clamped = preservePermille.coerceIn(0, 1000)
         val next = _fontSize.value.next()
         _fontSize.value = next
-        // Preserve current reading scroll fraction across font size changes
-        _targetScrollPermille.value = liveScrollPermille
+        liveScrollPermille = clamped
+        _targetScrollPermille.value = clamped
         _scrollRequestToken.value = _scrollRequestToken.value + 1L
         viewModelScope.launch {
             repository.setFontSize(next)
         }
+    }
+
+    fun togglePageMode(preservePermille: Int = liveScrollPermille) {
+        val clamped = preservePermille.coerceIn(0, 1000)
+        val next = _pageMode.value.toggle()
+        _pageMode.value = next
+        liveScrollPermille = clamped
+        _targetScrollPermille.value = clamped
+        _scrollRequestToken.value = _scrollRequestToken.value + 1L
+        viewModelScope.launch {
+            repository.setPageMode(next)
+        }
+    }
+
+    fun toggleFullScreen(preservePermille: Int = liveScrollPermille) {
+        val clamped = preservePermille.coerceIn(0, 1000)
+        _isFullScreen.value = !_isFullScreen.value
+        liveScrollPermille = clamped
+        _targetScrollPermille.value = clamped
+        _scrollRequestToken.value = _scrollRequestToken.value + 1L
     }
 
     fun cycleProgressMode() {
@@ -366,6 +406,8 @@ class TextReaderScreen(
         val errorText by viewModel.errorText.collectAsState()
         val chapterBookmarks by viewModel.chapterBookmarks.collectAsState()
         val fontSize by viewModel.fontSize.collectAsState()
+        val pageMode by viewModel.pageMode.collectAsState()
+        val isFullScreen by viewModel.isFullScreen.collectAsState()
         val progressMode by viewModel.progressMode.collectAsState()
         val lookupEnabled by viewModel.lookupEnabled.collectAsState()
         val isLookingUp by viewModel.isLookingUp.collectAsState()
@@ -379,22 +421,70 @@ class TextReaderScreen(
         val scrollState = rememberScrollState()
         val blockOffsets = remember(chapterIndex, fontSize) { mutableStateMapOf<Int, Int>() }
 
-        // Compute current scroll position as 0..1000 permille
-        val currentScrollPermille by remember(scrollState) {
+        val textVariant = when (fontSize) {
+            ReaderFontSize.COMPACT -> LightTextVariant.Detail
+            ReaderFontSize.REGULAR -> LightTextVariant.Paragraph
+            ReaderFontSize.LARGE -> LightTextVariant.Copy
+        }
+
+        val density = LocalDensity.current
+        val textMeasurer = rememberTextMeasurer()
+        val bodyStyle = scaledReaderStyle(textVariant)
+        val headingStyle = scaledReaderStyle(LightTextVariant.Subheading)
+        val horizontalPadDp = 1.5f.gridUnitsAsDp()
+        val horizontalPadPx = with(density) { horizontalPadDp.roundToPx() }
+        val verticalPagePadPx = with(density) { (if (isFullScreen) 24.dp else 12.dp).roundToPx() }
+        var viewportSize by remember { mutableStateOf(IntSize.Zero) }
+
+        val pages = remember(
+            currentChapter,
+            pageMode,
+            bodyStyle,
+            headingStyle,
+            viewportSize,
+            horizontalPadPx,
+            verticalPagePadPx,
+        ) {
+            if (pageMode != ReaderPageMode.PAGED || currentChapter == null || viewportSize.width <= 0 || viewportSize.height <= 0) {
+                emptyList()
+            } else {
+                EReaderPaginator.paginateBlocks(
+                    blocks = currentChapter.blocks,
+                    textMeasurer = textMeasurer,
+                    bodyStyle = bodyStyle,
+                    headingStyle = headingStyle,
+                    viewportWidthPx = (viewportSize.width - horizontalPadPx * 2).coerceAtLeast(100),
+                    viewportHeightPx = (viewportSize.height - verticalPagePadPx).coerceAtLeast(100),
+                    density = density,
+                )
+            }
+        }
+
+        var currentPageIndex by remember(chapterIndex) { mutableIntStateOf(0) }
+        val safePageIndex = if (pages.isEmpty()) 0 else currentPageIndex.coerceIn(0, pages.lastIndex)
+
+        // Compute current scroll position as 0..1000 permille (Scroll mode)
+        val scrollModePermille by remember(scrollState) {
             derivedStateOf {
                 val max = scrollState.maxValue
                 if (max <= 0) 0 else ((scrollState.value.toFloat() / max.toFloat()) * 1000f).roundToInt().coerceIn(0, 1000)
             }
         }
 
-        // Filled bookmark icon whenever current viewport is right at a saved bookmark in this chapter
-        val isNearSavedBookmark = remember(chapterBookmarks, currentScrollPermille) {
-            chapterBookmarks.any { abs(it.scrollPermille - currentScrollPermille) <= BOOKMARK_PROXIMITY_PERMILLE }
+        val activeScrollPermille = if (pageMode == ReaderPageMode.PAGED) {
+            pages.getOrNull(safePageIndex)?.permilleStart ?: targetScrollPermille
+        } else {
+            scrollModePermille
         }
 
-        // Restore exact scroll target (0 = top for new chapters, saved permille for bookmarks/resume/flip-back)
-        LaunchedEffect(chapterIndex, scrollRequestToken, currentChapter != null) {
-            if (currentChapter == null) return@LaunchedEffect
+        // Filled bookmark icon whenever current viewport/page is right at a saved bookmark in this chapter
+        val isNearSavedBookmark = remember(chapterBookmarks, activeScrollPermille) {
+            chapterBookmarks.any { abs(it.scrollPermille - activeScrollPermille) <= BOOKMARK_PROXIMITY_PERMILLE }
+        }
+
+        // Restore exact scroll target in SCROLL mode
+        LaunchedEffect(chapterIndex, scrollRequestToken, pageMode, currentChapter != null) {
+            if (pageMode != ReaderPageMode.SCROLL || currentChapter == null) return@LaunchedEffect
             val target = targetScrollPermille
             if (target <= 0) {
                 scrollState.scrollTo(0)
@@ -411,16 +501,33 @@ class TextReaderScreen(
             }
         }
 
-        // Report scroll updates to ViewModel so Continue Reading & flip-back memory stay exact
-        LaunchedEffect(chapterIndex, scrollState) {
-            snapshotFlow { currentScrollPermille }
+        // Restore exact page index in PAGED mode (on chapter load, Full-Screen toggle, font size change, or Scroll -> Pages)
+        LaunchedEffect(chapterIndex, scrollRequestToken, pageMode, pages) {
+            if (pageMode != ReaderPageMode.PAGED || pages.isEmpty()) return@LaunchedEffect
+            currentPageIndex = EReaderPaginator.pageIndexForPermille(pages, targetScrollPermille)
+        }
+
+        // Report scroll updates in SCROLL mode
+        LaunchedEffect(chapterIndex, pageMode, scrollState) {
+            if (pageMode != ReaderPageMode.SCROLL) return@LaunchedEffect
+            snapshotFlow { scrollModePermille }
                 .distinctUntilChanged()
                 .collect { permille ->
                     viewModel.onScrollChanged(permille)
                 }
         }
 
+        // Report page progress in PAGED mode
+        LaunchedEffect(chapterIndex, pageMode, safePageIndex, pages) {
+            if (pageMode != ReaderPageMode.PAGED || pages.isEmpty()) return@LaunchedEffect
+            val permille = pages.getOrNull(safePageIndex)?.permilleStart ?: 0
+            viewModel.onScrollChanged(permille)
+        }
+
         fun findVisibleSnippet(): String {
+            if (pageMode == ReaderPageMode.PAGED) {
+                return pages.getOrNull(safePageIndex)?.previewSnippet.orEmpty()
+            }
             val chapter = currentChapter ?: return ""
             if (chapter.blocks.isEmpty()) return ""
             val scrollY = scrollState.value
@@ -429,15 +536,37 @@ class TextReaderScreen(
                 .maxByOrNull { it.value }
                 ?.key
                 ?: blockOffsets.entries.minByOrNull { abs(it.value - scrollY) }?.key
-                ?: ((currentScrollPermille / 1000f) * chapter.blocks.lastIndex).roundToInt()
+                ?: ((scrollModePermille / 1000f) * chapter.blocks.lastIndex).roundToInt()
                     .coerceIn(0, chapter.blocks.lastIndex)
             return chapter.blocks.getOrNull(bestIdx)?.text.orEmpty()
         }
 
-        val textVariant = when (fontSize) {
-            ReaderFontSize.COMPACT -> LightTextVariant.Detail
-            ReaderFontSize.REGULAR -> LightTextVariant.Paragraph
-            ReaderFontSize.LARGE -> LightTextVariant.Copy
+        fun turnNextPageOrChapter() {
+            if (pageMode == ReaderPageMode.PAGED) {
+                if (safePageIndex < pages.lastIndex) {
+                    currentPageIndex = safePageIndex + 1
+                } else if (hasNext) {
+                    viewModel.nextChapter(landOnStart = true)
+                }
+            } else if (hasNext) {
+                viewModel.nextChapter()
+            }
+        }
+
+        fun turnPrevPageOrChapter() {
+            if (pageMode == ReaderPageMode.PAGED) {
+                if (safePageIndex > 0) {
+                    currentPageIndex = safePageIndex - 1
+                } else if (hasPrev) {
+                    viewModel.previousChapter(landOnEnd = true)
+                } else {
+                    goBack()
+                }
+            } else if (hasPrev) {
+                viewModel.previousChapter()
+            } else {
+                goBack()
+            }
         }
 
         val contentColor = LightThemeTokens.colors.content
@@ -449,16 +578,21 @@ class TextReaderScreen(
         )
 
         val haptics = LocalHapticFeedback.current
+        val edgeBackThresholdPx = with(density) { 44.dp.toPx() }
         var dragAccumulator by remember(chapterIndex) { mutableFloatStateOf(0f) }
         var dragStartX by remember(chapterIndex) { mutableFloatStateOf(0f) }
         val isOverlayOpen = isLookingUp || lookupResult != null
+
+        val liveActivePermille by rememberUpdatedState(activeScrollPermille)
+        val liveTurnNext by rememberUpdatedState(::turnNextPageOrChapter)
+        val liveTurnPrev by rememberUpdatedState(::turnPrevPageOrChapter)
 
         LightTheme(colors = themeColors) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
                     .background(LightThemeTokens.colors.background)
-                    .pointerInput(chapterIndex, isOverlayOpen, hasPrev, hasNext) {
+                    .pointerInput(chapterIndex, isOverlayOpen) {
                         if (isOverlayOpen) return@pointerInput
                         detectHorizontalDragGestures(
                             onDragStart = { offset ->
@@ -467,13 +601,13 @@ class TextReaderScreen(
                             },
                             onDragEnd = {
                                 if (dragAccumulator > 70f) {
-                                    if (dragStartX <= 260f || !hasPrev) {
+                                    if (dragStartX <= edgeBackThresholdPx) {
                                         goBack()
                                     } else {
-                                        viewModel.previousChapter()
+                                        liveTurnPrev()
                                     }
-                                } else if (dragAccumulator < -80f && hasNext) {
-                                    viewModel.nextChapter()
+                                } else if (dragAccumulator < -80f) {
+                                    liveTurnNext()
                                 }
                                 dragAccumulator = 0f
                             },
@@ -485,128 +619,162 @@ class TextReaderScreen(
                     },
             ) {
                 Column(modifier = Modifier.fillMaxSize()) {
-                    LightTopBar(
-                        leftButton = LightBarButton.LightIcon(
-                            icon = LightIcons.BACK,
-                            onClick = { goBack() },
-                        ),
-                        center = LightTopBarCenter.Text(
-                            text = currentChapter?.title ?: book?.title ?: "Reader",
-                        ),
-                        rightButton = LightBarButton.Icon(
-                            painter = bookmarkPainter,
-                            contentDescription = if (isNearSavedBookmark) "Bookmarked here" else "Bookmark this spot",
-                            onClick = {
-                                viewModel.toggleBookmarkAt(
-                                    scrollPermille = currentScrollPermille,
-                                    visibleSnippet = findVisibleSnippet(),
-                                )
-                            },
-                        ),
-                        modifier = Modifier.padding(bottom = 0.5f.gridUnitsAsDp()),
-                    )
-
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(
-                                start = 1.5f.gridUnitsAsDp(),
-                                end = 1.5f.gridUnitsAsDp(),
-                                top = 2.dp,
-                                bottom = 6.dp,
+                    if (!isFullScreen) {
+                        LightTopBar(
+                            leftButton = LightBarButton.LightIcon(
+                                icon = LightIcons.BACK,
+                                onClick = { goBack() },
                             ),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        val progressText = if (totalChapters > 0) {
-                            when (progressMode) {
-                                ReaderProgressMode.BOOK -> {
-                                    val bookPct = (
-                                        ((chapterIndex.toFloat() + (currentScrollPermille / 1000f)) / totalChapters.toFloat()) * 100f
-                                        ).roundToInt().coerceIn(0, 100)
-                                    if (totalChapters > 1) {
-                                        "Ch. ${chapterIndex + 1}/$totalChapters • $bookPct% book"
-                                    } else {
-                                        "$bookPct% book"
-                                    }
-                                }
-                                ReaderProgressMode.CHAPTER -> {
-                                    val scrollPct = (currentScrollPermille / 10).coerceIn(0, 100)
-                                    if (totalChapters > 1) {
-                                        "Ch. ${chapterIndex + 1}/$totalChapters • $scrollPct% ch."
-                                    } else {
-                                        "$scrollPct% ch."
-                                    }
-                                }
-                                ReaderProgressMode.HIDDEN -> {
-                                    if (totalChapters > 1) {
-                                        "Ch. ${chapterIndex + 1}/$totalChapters"
-                                    } else {
-                                        "•••"
-                                    }
-                                }
-                            }
-                        } else {
-                            book?.title.orEmpty()
-                        }
-                        LightText(
-                            text = progressText,
-                            variant = LightTextVariant.Detail,
-                            lighten = true,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier
-                                .weight(1f)
-                                .lightClickable { viewModel.cycleProgressMode() },
+                            center = LightTopBarCenter.Text(
+                                text = currentChapter?.title ?: book?.title ?: "Reader",
+                            ),
+                            rightButton = LightBarButton.Icon(
+                                painter = bookmarkPainter,
+                                contentDescription = if (isNearSavedBookmark) "Bookmarked here" else "Bookmark this spot",
+                                onClick = {
+                                    viewModel.toggleBookmarkAt(
+                                        scrollPermille = activeScrollPermille,
+                                        visibleSnippet = findVisibleSnippet(),
+                                    )
+                                },
+                            ),
+                            modifier = Modifier.padding(bottom = 0.5f.gridUnitsAsDp()),
                         )
 
-                        if (totalChapters > 1) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(
+                                    start = 1.5f.gridUnitsAsDp(),
+                                    end = 1.5f.gridUnitsAsDp(),
+                                    top = 2.dp,
+                                    bottom = 6.dp,
+                                ),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            val progressText = if (totalChapters > 0) {
+                                when (progressMode) {
+                                    ReaderProgressMode.BOOK -> {
+                                        val bookPct = (
+                                            ((chapterIndex.toFloat() + (activeScrollPermille / 1000f)) / totalChapters.toFloat()) * 100f
+                                            ).roundToInt().coerceIn(0, 100)
+                                        if (totalChapters > 1) {
+                                            "Ch. ${chapterIndex + 1}/$totalChapters • $bookPct%"
+                                        } else {
+                                            "$bookPct% book"
+                                        }
+                                    }
+                                    ReaderProgressMode.CHAPTER -> {
+                                        val scrollPct = (activeScrollPermille / 10).coerceIn(0, 100)
+                                        if (totalChapters > 1) {
+                                            "Ch. ${chapterIndex + 1}/$totalChapters • $scrollPct% ch."
+                                        } else {
+                                            "$scrollPct% ch."
+                                        }
+                                    }
+                                    ReaderProgressMode.HIDDEN -> {
+                                        if (totalChapters > 1) {
+                                            "Ch. ${chapterIndex + 1}/$totalChapters"
+                                        } else {
+                                            "•••"
+                                        }
+                                    }
+                                }
+                            } else {
+                                book?.title.orEmpty()
+                            }
+                            LightText(
+                                text = progressText,
+                                variant = LightTextVariant.Detail,
+                                lighten = true,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .lightClickable { viewModel.cycleProgressMode() },
+                            )
+
+                            if (totalChapters > 1) {
+                                Box(
+                                    modifier = Modifier
+                                        .padding(start = 6.dp)
+                                        .border(
+                                            width = 1.dp,
+                                            color = LightThemeTokens.colors.content.copy(alpha = 0.45f),
+                                            shape = RoundedCornerShape(4.dp),
+                                        )
+                                        .lightClickable {
+                                            val titles = book?.chapters?.map { it.title }.orEmpty()
+                                            navigateTo(
+                                                screenFactory = { act ->
+                                                    TocScreen(
+                                                        sealedActivity = act,
+                                                        bookTitle = book?.title ?: "Contents",
+                                                        chapterTitles = titles,
+                                                        currentChapterIndex = chapterIndex,
+                                                    )
+                                                },
+                                                resultCallback = { chosenIndex ->
+                                                    viewModel.openChapter(chosenIndex)
+                                                },
+                                            )
+                                        }
+                                        .padding(horizontal = 6.dp, vertical = 2.dp),
+                                ) {
+                                    LightText(
+                                        text = "Contents",
+                                        variant = LightTextVariant.Detail,
+                                    )
+                                }
+                            }
+
+                            val pagedActive = pageMode == ReaderPageMode.PAGED
                             Box(
                                 modifier = Modifier
-                                    .padding(start = 8.dp)
+                                    .padding(start = 6.dp)
+                                    .background(
+                                        if (pagedActive) LightThemeTokens.colors.content else LightThemeTokens.colors.background,
+                                        RoundedCornerShape(4.dp),
+                                    )
                                     .border(
                                         width = 1.dp,
-                                        color = LightThemeTokens.colors.content.copy(alpha = 0.45f),
+                                        color = LightThemeTokens.colors.content.copy(alpha = 0.55f),
                                         shape = RoundedCornerShape(4.dp),
                                     )
-                                    .lightClickable {
-                                        val titles = book?.chapters?.map { it.title }.orEmpty()
-                                        navigateTo(
-                                            screenFactory = { act ->
-                                                TocScreen(
-                                                    sealedActivity = act,
-                                                    bookTitle = book?.title ?: "Contents",
-                                                    chapterTitles = titles,
-                                                    currentChapterIndex = chapterIndex,
-                                                )
-                                            },
-                                            resultCallback = { chosenIndex ->
-                                                viewModel.openChapter(chosenIndex)
-                                            },
-                                        )
-                                    }
-                                    .padding(horizontal = 7.dp, vertical = 2.dp),
+                                    .lightClickable { viewModel.togglePageMode(activeScrollPermille) }
+                                    .padding(horizontal = 6.dp, vertical = 2.dp),
                             ) {
                                 LightText(
-                                    text = "Contents",
+                                    text = pageMode.chipLabel,
                                     variant = LightTextVariant.Detail,
+                                    color = if (pagedActive) LightThemeTokens.colors.background else LightThemeTokens.colors.content,
                                 )
                             }
-                        }
 
-                        LightText(
-                            text = fontSize.displayLabel,
-                            variant = LightTextVariant.Detail,
-                            lighten = true,
-                            modifier = Modifier
-                                .padding(start = 12.dp)
-                                .lightClickable { viewModel.cycleFontSize() },
-                        )
+                            LightText(
+                                text = fontSize.displayLabel,
+                                variant = LightTextVariant.Detail,
+                                lighten = true,
+                                modifier = Modifier
+                                    .padding(start = 8.dp)
+                                    .lightClickable { viewModel.cycleFontSize(activeScrollPermille) },
+                            )
+                        }
                     }
 
                     Box(
                         modifier = Modifier
                             .weight(1f)
-                            .fillMaxWidth(),
+                            .fillMaxWidth()
+                            .onSizeChanged { viewportSize = it }
+                            .pointerInput(isOverlayOpen) {
+                                if (isOverlayOpen) return@pointerInput
+                                detectTapGestures(
+                                    onDoubleTap = {
+                                        viewModel.toggleFullScreen(liveActivePermille)
+                                    },
+                                )
+                            },
                     ) {
                         when {
                             isLoading -> {
@@ -627,17 +795,101 @@ class TextReaderScreen(
                                     )
                                 }
                             }
+                            currentChapter != null && pageMode == ReaderPageMode.PAGED -> {
+                                val currentPage = pages.getOrNull(safePageIndex)
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .padding(
+                                            horizontal = horizontalPadDp,
+                                            vertical = if (isFullScreen) 12.dp else 6.dp,
+                                        ),
+                                ) {
+                                    currentPage?.slices?.forEach { slice ->
+                                        when {
+                                            slice.isHeading -> {
+                                                LightText(
+                                                    text = slice.text,
+                                                    variant = LightTextVariant.Subheading,
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .padding(
+                                                            top = if (slice.isContinuation) 2.dp else 10.dp,
+                                                            bottom = 6.dp,
+                                                        ),
+                                                )
+                                            }
+                                            slice.isQuote -> {
+                                                Row(
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .padding(
+                                                            top = if (slice.isContinuation) 2.dp else 4.dp,
+                                                            bottom = 10.dp,
+                                                        ),
+                                                ) {
+                                                    Box(
+                                                        modifier = Modifier
+                                                            .width(2.dp)
+                                                            .heightIn(min = 24.dp)
+                                                            .background(LightThemeTokens.colors.content.copy(alpha = 0.45f)),
+                                                    )
+                                                    Spacer(modifier = Modifier.width(10.dp))
+                                                    LookupableReaderText(
+                                                        text = slice.text,
+                                                        variant = textVariant,
+                                                        lighten = true,
+                                                        lookupEnabled = lookupEnabled,
+                                                        onLongPressChar = { offset ->
+                                                            haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                            viewModel.lookupWordAt(slice.text, offset)
+                                                        },
+                                                        onDoubleTap = {
+                                                            viewModel.toggleFullScreen(liveActivePermille)
+                                                        },
+                                                        modifier = Modifier.weight(1f),
+                                                    )
+                                                }
+                                            }
+                                            else -> {
+                                                LookupableReaderText(
+                                                    text = slice.text,
+                                                    variant = textVariant,
+                                                    lighten = false,
+                                                    lookupEnabled = lookupEnabled,
+                                                    onLongPressChar = { offset ->
+                                                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                        viewModel.lookupWordAt(slice.text, offset)
+                                                    },
+                                                    onDoubleTap = {
+                                                        viewModel.toggleFullScreen(liveActivePermille)
+                                                    },
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .padding(
+                                                            top = if (slice.isContinuation) 2.dp else 4.dp,
+                                                            bottom = 10.dp,
+                                                        ),
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             currentChapter != null -> {
                                 LightScrollView(
                                     scrollState = scrollState,
                                     modifier = Modifier
                                         .fillMaxSize()
-                                        .padding(start = 1.5f.gridUnitsAsDp()),
+                                        .padding(
+                                            start = horizontalPadDp,
+                                            top = if (isFullScreen) 10.dp else 0.dp,
+                                            bottom = if (isFullScreen) 10.dp else 0.dp,
+                                        ),
                                 ) {
                                     Spacer(modifier = Modifier.height(10.dp))
 
                                     currentChapter.blocks.forEachIndexed { idx, block ->
-                                        val rightPad = 1.5f.gridUnitsAsDp()
                                         val trackOffsetModifier = Modifier.onGloballyPositioned { coords ->
                                             blockOffsets[idx] = coords.positionInParent().y.roundToInt()
                                         }
@@ -648,14 +900,14 @@ class TextReaderScreen(
                                                     variant = LightTextVariant.Subheading,
                                                     modifier = trackOffsetModifier
                                                         .fillMaxWidth()
-                                                        .padding(end = rightPad, top = 12.dp, bottom = 8.dp),
+                                                        .padding(end = horizontalPadDp, top = 12.dp, bottom = 8.dp),
                                                 )
                                             }
                                             block.isQuote -> {
                                                 Row(
                                                     modifier = trackOffsetModifier
                                                         .fillMaxWidth()
-                                                        .padding(end = rightPad, top = 6.dp, bottom = 10.dp),
+                                                        .padding(end = horizontalPadDp, top = 6.dp, bottom = 10.dp),
                                                 ) {
                                                     Box(
                                                         modifier = Modifier
@@ -673,6 +925,9 @@ class TextReaderScreen(
                                                             haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                                                             viewModel.lookupWordAt(block.text, offset)
                                                         },
+                                                        onDoubleTap = {
+                                                            viewModel.toggleFullScreen(liveActivePermille)
+                                                        },
                                                         modifier = Modifier.weight(1f),
                                                     )
                                                 }
@@ -687,43 +942,95 @@ class TextReaderScreen(
                                                         haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                                                         viewModel.lookupWordAt(block.text, offset)
                                                     },
+                                                    onDoubleTap = {
+                                                        viewModel.toggleFullScreen(liveActivePermille)
+                                                    },
                                                     modifier = trackOffsetModifier
                                                         .fillMaxWidth()
-                                                        .padding(end = rightPad, top = 4.dp, bottom = 10.dp),
+                                                        .padding(end = horizontalPadDp, top = 4.dp, bottom = 10.dp),
                                                 )
                                             }
                                         }
                                     }
 
-                                    Spacer(modifier = Modifier.height(18.dp))
-                                    Row(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .padding(end = 1.5f.gridUnitsAsDp(), top = 8.dp, bottom = 18.dp),
-                                        verticalAlignment = Alignment.CenterVertically,
-                                    ) {
-                                        if (hasPrev) {
-                                            LightText(
-                                                text = "← Previous",
-                                                variant = LightTextVariant.Detail,
-                                                lighten = true,
-                                                modifier = Modifier
-                                                    .weight(1f)
-                                                    .lightClickable { viewModel.previousChapter() },
-                                            )
-                                        } else {
-                                            Spacer(modifier = Modifier.weight(1f))
-                                        }
+                                    if (!isFullScreen) {
+                                        Spacer(modifier = Modifier.height(18.dp))
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(end = horizontalPadDp, top = 8.dp, bottom = 18.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                        ) {
+                                            if (hasPrev) {
+                                                LightText(
+                                                    text = "← Previous",
+                                                    variant = LightTextVariant.Detail,
+                                                    lighten = true,
+                                                    modifier = Modifier
+                                                        .weight(1f)
+                                                        .lightClickable { viewModel.previousChapter() },
+                                                )
+                                            } else {
+                                                Spacer(modifier = Modifier.weight(1f))
+                                            }
 
-                                        if (hasNext) {
-                                            LightText(
-                                                text = "Next →",
-                                                variant = LightTextVariant.Detail,
-                                                lighten = true,
-                                                modifier = Modifier.lightClickable { viewModel.nextChapter() },
-                                            )
+                                            if (hasNext) {
+                                                LightText(
+                                                    text = "Next →",
+                                                    variant = LightTextVariant.Detail,
+                                                    lighten = true,
+                                                    modifier = Modifier.lightClickable { viewModel.nextChapter() },
+                                                )
+                                            }
                                         }
+                                    } else {
+                                        Spacer(modifier = Modifier.height(14.dp))
                                     }
+                                }
+                            }
+                        }
+                    }
+
+                    // Quiet bottom page indicator & tap controls in PAGED mode (hidden in Full Screen)
+                    if (!isFullScreen && pageMode == ReaderPageMode.PAGED && currentChapter != null && pages.isNotEmpty()) {
+                        val canGoBack = safePageIndex > 0 || hasPrev
+                        val canGoForward = safePageIndex < pages.lastIndex || hasNext
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = horizontalPadDp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            if (canGoBack) {
+                                LightText(
+                                    text = "← Prev",
+                                    variant = LightTextVariant.Detail,
+                                    lighten = true,
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .lightClickable { turnPrevPageOrChapter() },
+                                )
+                            } else {
+                                Spacer(modifier = Modifier.weight(1f))
+                            }
+
+                            LightText(
+                                text = "${safePageIndex + 1} / ${pages.size}",
+                                variant = LightTextVariant.Detail,
+                                lighten = true,
+                            )
+
+                            Box(
+                                modifier = Modifier.weight(1f),
+                                contentAlignment = Alignment.CenterEnd,
+                            ) {
+                                if (canGoForward) {
+                                    LightText(
+                                        text = "Next →",
+                                        variant = LightTextVariant.Detail,
+                                        lighten = true,
+                                        modifier = Modifier.lightClickable { turnNextPageOrChapter() },
+                                    )
                                 }
                             }
                         }
@@ -764,25 +1071,29 @@ internal fun LookupableReaderText(
     lighten: Boolean,
     lookupEnabled: Boolean,
     onLongPressChar: (Int) -> Unit,
+    onDoubleTap: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val style = scaledReaderStyle(variant)
     val colors = LightThemeTokens.colors
     val color = if (lighten) colors.contentSecondary else colors.content
     var layoutResult by remember(text, variant) { mutableStateOf<TextLayoutResult?>(null) }
+    val currentOnDoubleTap by rememberUpdatedState(onDoubleTap)
+    val currentOnLongPress by rememberUpdatedState(onLongPressChar)
 
-    val mod = if (lookupEnabled) {
-        modifier.pointerInput(text, lookupEnabled) {
-            detectTapGestures(
-                onLongPress = { pos ->
+    val mod = modifier.pointerInput(text, lookupEnabled) {
+        detectTapGestures(
+            onDoubleTap = { currentOnDoubleTap() },
+            onLongPress = if (lookupEnabled) {
+                { pos ->
                     layoutResult?.let { layout ->
-                        onLongPressChar(layout.getOffsetForPosition(pos))
+                        currentOnLongPress(layout.getOffsetForPosition(pos))
                     }
-                },
-            )
-        }
-    } else {
-        modifier
+                }
+            } else {
+                null
+            },
+        )
     }
 
     Text(
@@ -795,11 +1106,12 @@ internal fun LookupableReaderText(
 }
 
 @Composable
-private fun scaledReaderStyle(variant: LightTextVariant): TextStyle {
+internal fun scaledReaderStyle(variant: LightTextVariant): TextStyle {
     val t = LightThemeTokens.typography
     val base = when (variant) {
         LightTextVariant.Detail -> t.detail
         LightTextVariant.Copy -> t.copy
+        LightTextVariant.Subheading -> t.subheading
         else -> t.paragraph
     }
     return base.copy(

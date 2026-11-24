@@ -8,6 +8,10 @@ import com.setholson.ereader.data.WifiBookServer
 import com.setholson.ereader.model.BookFormat
 import com.setholson.ereader.model.DictionaryPack
 import com.setholson.ereader.model.ReaderFontSize
+import com.setholson.ereader.model.ReaderPageMode
+import com.setholson.ereader.ui.EReaderPage
+import com.setholson.ereader.ui.EReaderPageSlice
+import com.setholson.ereader.ui.EReaderPaginator
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URI
@@ -323,6 +327,48 @@ class EReaderTest {
         assertEquals(ReaderFontSize.COMPACT, ReaderFontSize.LARGE.next())
         assertEquals(ReaderFontSize.REGULAR, ReaderFontSize.COMPACT.next())
         assertFalse(BookFormat.EPUB.extensions.isEmpty())
+    }
+
+    @Test
+    fun readerPageModeAndPaginatorPermilleMapping() {
+        assertEquals(ReaderPageMode.PAGED, ReaderPageMode.SCROLL.toggle())
+        assertEquals(ReaderPageMode.SCROLL, ReaderPageMode.PAGED.toggle())
+        assertEquals(ReaderPageMode.PAGED, ReaderPageMode.fromName("PAGED"))
+        assertEquals(ReaderPageMode.SCROLL, ReaderPageMode.fromName("invalid"))
+
+        val pages = listOf(
+            EReaderPage(
+                pageIndex = 0,
+                slices = listOf(
+                    EReaderPageSlice(0, "Chapter 1", isHeading = true, isQuote = false, isContinuation = false),
+                    EReaderPageSlice(1, "Opening line of the chapter.", isHeading = false, isQuote = false, isContinuation = false),
+                ),
+                permilleStart = 0,
+            ),
+            EReaderPage(
+                pageIndex = 1,
+                slices = listOf(
+                    EReaderPageSlice(2, "Middle paragraph of the PDF chapter.", isHeading = false, isQuote = false, isContinuation = false),
+                ),
+                permilleStart = 350,
+            ),
+            EReaderPage(
+                pageIndex = 2,
+                slices = listOf(
+                    EReaderPageSlice(3, "Closing paragraph.", isHeading = false, isQuote = false, isContinuation = false),
+                ),
+                permilleStart = 720,
+            ),
+        )
+
+        assertEquals("Opening line of the chapter.", pages[0].previewSnippet)
+        assertEquals(0, EReaderPaginator.pageIndexForPermille(pages, 0))
+        assertEquals(0, EReaderPaginator.pageIndexForPermille(pages, 349))
+        assertEquals(1, EReaderPaginator.pageIndexForPermille(pages, 350))
+        assertEquals(1, EReaderPaginator.pageIndexForPermille(pages, 719))
+        assertEquals(2, EReaderPaginator.pageIndexForPermille(pages, 720))
+        assertEquals(2, EReaderPaginator.pageIndexForPermille(pages, 1000))
+        assertEquals(0, EReaderPaginator.pageIndexForPermille(emptyList(), 420))
     }
 
     private fun writeZip(target: File, entries: Map<String, String>) {

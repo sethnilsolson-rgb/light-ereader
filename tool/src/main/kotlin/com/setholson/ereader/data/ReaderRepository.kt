@@ -12,6 +12,7 @@ import com.setholson.ereader.model.FreeCatalogBook
 import com.setholson.ereader.model.LibraryBook
 import com.setholson.ereader.model.ParsedBook
 import com.setholson.ereader.model.ReaderFontSize
+import com.setholson.ereader.model.ReaderPageMode
 import com.setholson.ereader.model.ReaderProgressMode
 import com.setholson.ereader.model.WordLookupResult
 import com.thelightphone.toolmanager.LightFileProvider
@@ -57,6 +58,10 @@ class ReaderRepository(
         ReaderFontSize.fromName(map[KEY_FONT_SIZE])
     }
 
+    val pageModeFlow: Flow<ReaderPageMode> = settingsMap.map { map ->
+        ReaderPageMode.fromName(map[KEY_PAGE_MODE])
+    }
+
     val pdfDarkInvertFlow: Flow<Boolean> = settingsMap.map { map ->
         map[KEY_PDF_DARK_INVERT]?.toBooleanStrictOrNull() ?: true
     }
@@ -82,6 +87,14 @@ class ReaderRepository(
 
     suspend fun getFontSizeSync(): ReaderFontSize = withContext(Dispatchers.IO) {
         ReaderFontSize.fromName(database.settingDao().getSettingSync(KEY_FONT_SIZE))
+    }
+
+    suspend fun setPageMode(mode: ReaderPageMode) = withContext(Dispatchers.IO) {
+        database.settingDao().putSetting(ReaderSettingEntity(KEY_PAGE_MODE, mode.name))
+    }
+
+    suspend fun getPageModeSync(): ReaderPageMode = withContext(Dispatchers.IO) {
+        ReaderPageMode.fromName(database.settingDao().getSettingSync(KEY_PAGE_MODE))
     }
 
     suspend fun setProgressMode(mode: ReaderProgressMode) = withContext(Dispatchers.IO) {
@@ -585,6 +598,7 @@ class ReaderRepository(
     companion object {
         const val DATABASE_NAME = "light_ereader.db"
         private const val KEY_FONT_SIZE = "font_size"
+        private const val KEY_PAGE_MODE = "reader_page_mode"
         private const val KEY_PROGRESS_MODE = "progress_mode"
         private const val KEY_PDF_DARK_INVERT = "pdf_dark_invert"
         private const val KEY_PDF_ROTATION_PREFIX = "pdf_rot_"

@@ -31,6 +31,21 @@ enum class ReaderFontSize(val label: String, val displayLabel: String) {
     }
 }
 
+enum class ReaderPageMode(val label: String, val chipLabel: String) {
+    SCROLL("Scroll", "Scroll"),
+    PAGED("Pages", "Pages");
+
+    fun toggle(): ReaderPageMode = when (this) {
+        SCROLL -> PAGED
+        PAGED -> SCROLL
+    }
+
+    companion object {
+        fun fromName(name: String?): ReaderPageMode =
+            entries.firstOrNull { it.name.equals(name, ignoreCase = true) } ?: SCROLL
+    }
+}
+
 enum class ReaderProgressMode(val label: String) {
     BOOK("Book %"),
     CHAPTER("Chapter %"),

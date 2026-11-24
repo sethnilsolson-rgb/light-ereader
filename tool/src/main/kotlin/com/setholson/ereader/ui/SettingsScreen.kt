@@ -26,6 +26,7 @@ import com.setholson.ereader.data.ReaderRepository
 import com.setholson.ereader.db.ReaderDatabase
 import com.setholson.ereader.model.DictionaryPack
 import com.setholson.ereader.model.LibraryBook
+import com.setholson.ereader.model.ReaderPageMode
 import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
@@ -59,6 +60,9 @@ class SettingsViewModel(
 
     private val _pdfDarkInvert = MutableStateFlow(true)
     val pdfDarkInvert: StateFlow<Boolean> = _pdfDarkInvert.asStateFlow()
+
+    private val _pageMode = MutableStateFlow(ReaderPageMode.SCROLL)
+    val pageMode: StateFlow<ReaderPageMode> = _pageMode.asStateFlow()
 
     private val _dictCounts = MutableStateFlow<Map<String, Int>>(emptyMap())
     val dictCounts: StateFlow<Map<String, Int>> = _dictCounts.asStateFlow()
@@ -94,12 +98,14 @@ class SettingsViewModel(
                 repository.pdfDarkInvertFlow,
                 repository.primaryDictIdFlow,
                 repository.onlineDictEnabledFlow,
-            ) { pdfInv, primaryId, onlineOn ->
-                Triple(pdfInv, primaryId, onlineOn)
-            }.collect { (pdfInv, primaryId, onlineOn) ->
-                _pdfDarkInvert.value = pdfInv
-                _primaryDictId.value = primaryId
-                _onlineDictEnabled.value = onlineOn
+                repository.pageModeFlow,
+            ) { pdfInv, primaryId, onlineOn, mode ->
+                SettingsUiSnapshot(pdfInv, primaryId, onlineOn, mode)
+            }.collect { snap ->
+                _pdfDarkInvert.value = snap.pdfDarkInvert
+                _primaryDictId.value = snap.primaryDictId
+                _onlineDictEnabled.value = snap.onlineDictEnabled
+                _pageMode.value = snap.pageMode
             }
         }
 
@@ -124,6 +130,14 @@ class SettingsViewModel(
         _pdfDarkInvert.value = next
         viewModelScope.launch {
             repository.setPdfDarkInvert(next)
+        }
+    }
+
+    fun togglePageMode() {
+        val next = _pageMode.value.toggle()
+        _pageMode.value = next
+        viewModelScope.launch {
+            repository.setPageMode(next)
         }
     }
 
@@ -192,6 +206,7 @@ class SettingsScreen(
     override fun Content() {
         val themeColors by LightThemeController.colors.collectAsState()
         val pdfDarkInvert by viewModel.pdfDarkInvert.collectAsState()
+        val pageMode by viewModel.pageMode.collectAsState()
         val dictCounts by viewModel.dictCounts.collectAsState()
         val primaryDictId by viewModel.primaryDictId.collectAsState()
         val onlineDictEnabled by viewModel.onlineDictEnabled.collectAsState()
@@ -281,6 +296,43 @@ class SettingsScreen(
                                 label = if (isDark) "Light" else "Dark",
                                 highlighted = false,
                                 onClick = { LightThemeController.toggle() },
+                            )
+                        }
+
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(end = rightPad, bottom = 10.dp)
+                                .border(
+                                    width = 1.dp,
+                                    color = LightThemeTokens.colors.content.copy(alpha = 0.4f),
+                                    shape = RoundedCornerShape(4.dp),
+                                )
+                                .lightClickable { viewModel.togglePageMode() }
+                                .padding(horizontal = 12.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                LightText(
+                                    text = "Reading Format: ${pageMode.label}",
+                                    variant = LightTextVariant.Subheading,
+                                )
+                                LightText(
+                                    text = if (pageMode == ReaderPageMode.PAGED) {
+                                        "Swipe on words to turn pages like a book. Double-tap for full screen."
+                                    } else {
+                                        "Continuous scroll through chapters. Double-tap for full screen."
+                                    },
+                                    variant = LightTextVariant.Detail,
+                                    lighten = true,
+                                    modifier = Modifier.padding(top = 2.dp),
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(8.dp))
+                            SettingsPill(
+                                label = pageMode.chipLabel,
+                                highlighted = pageMode == ReaderPageMode.PAGED,
+                                onClick = { viewModel.togglePageMode() },
                             )
                         }
 
@@ -507,6 +559,13 @@ class SettingsScreen(
         }
     }
 }
+
+private data class SettingsUiSnapshot(
+    val pdfDarkInvert: Boolean,
+    val primaryDictId: String?,
+    val onlineDictEnabled: Boolean,
+    val pageMode: ReaderPageMode,
+)
 
 @Composable
 private fun SettingsPill(

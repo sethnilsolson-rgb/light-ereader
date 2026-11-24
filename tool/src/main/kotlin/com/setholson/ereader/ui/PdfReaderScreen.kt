@@ -27,12 +27,16 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
@@ -46,9 +50,12 @@ import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewModelScope
@@ -57,10 +64,13 @@ import com.setholson.ereader.data.PdfExtractionMode
 import com.setholson.ereader.data.PdfTextExtractionResult
 import com.setholson.ereader.data.ReaderRepository
 import com.setholson.ereader.data.RenderedPdfPage
+import com.setholson.ereader.db.BookBookmarkEntity
 import com.setholson.ereader.db.ReaderDatabase
 import com.setholson.ereader.model.BookFormat
 import com.setholson.ereader.model.ReaderFontSize
+import com.setholson.ereader.model.ReaderPageMode
 import com.setholson.ereader.model.ReaderProgressMode
+import com.setholson.ereader.model.TextBlock
 import com.setholson.ereader.model.WordLookupResult
 import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
@@ -84,16 +94,21 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 private const val MIN_PDF_SCALE = 1.0f
 private const val MAX_PDF_SCALE = 8.0f
+private const val PDF_BRIEF_SCROLL_MEMORY_MS = 180_000L
 
 private val INVERT_COLOR_FILTER = ColorFilter.colorMatrix(
     ColorMatrix(
@@ -119,6 +134,7 @@ class PdfReaderViewModel(
     private val bookId: String,
     private val bookTitle: String,
     private val explicitStartPage: Int?,
+    private val explicitStartScrollPermille: Int?,
     private val repository: ReaderRepository,
 ) : LightViewModel<Unit>() {
 
@@ -127,6 +143,12 @@ class PdfReaderViewModel(
 
     private val _pageCount = MutableStateFlow(0)
     val pageCount: StateFlow<Int> = _pageCount.asStateFlow()
+
+    private val _targetScrollPermille = MutableStateFlow(0)
+    val targetScrollPermille: StateFlow<Int> = _targetScrollPermille.asStateFlow()
+
+    private val _scrollRequestToken = MutableStateFlow(0L)
+    val scrollRequestToken: StateFlow<Long> = _scrollRequestToken.asStateFlow()
 
     private val _renderedPage = MutableStateFlow<RenderedPdfPage?>(null)
     val renderedPage: StateFlow<RenderedPdfPage?> = _renderedPage.asStateFlow()
@@ -140,8 +162,8 @@ class PdfReaderViewModel(
     private val _errorText = MutableStateFlow<String?>(null)
     val errorText: StateFlow<String?> = _errorText.asStateFlow()
 
-    private val _isBookmarked = MutableStateFlow(false)
-    val isBookmarked: StateFlow<Boolean> = _isBookmarked.asStateFlow()
+    private val _pageBookmarks = MutableStateFlow<List<BookBookmarkEntity>>(emptyList())
+    val pageBookmarks: StateFlow<List<BookBookmarkEntity>> = _pageBookmarks.asStateFlow()
 
     private val _invertColors = MutableStateFlow(false)
     val invertColors: StateFlow<Boolean> = _invertColors.asStateFlow()
@@ -174,6 +196,12 @@ class PdfReaderViewModel(
     private val _fontSize = MutableStateFlow(ReaderFontSize.REGULAR)
     val fontSize: StateFlow<ReaderFontSize> = _fontSize.asStateFlow()
 
+    private val _pageMode = MutableStateFlow(ReaderPageMode.SCROLL)
+    val pageMode: StateFlow<ReaderPageMode> = _pageMode.asStateFlow()
+
+    private val _isFullScreen = MutableStateFlow(false)
+    val isFullScreen: StateFlow<Boolean> = _isFullScreen.asStateFlow()
+
     private val _lookupEnabled = MutableStateFlow(false)
     val lookupEnabled: StateFlow<Boolean> = _lookupEnabled.asStateFlow()
 
@@ -183,6 +211,8 @@ class PdfReaderViewModel(
     private val _lookupResult = MutableStateFlow<WordLookupResult?>(null)
     val lookupResult: StateFlow<WordLookupResult?> = _lookupResult.asStateFlow()
 
+    private val recentScrollPositions = mutableMapOf<Int, Pair<Int, Long>>()
+    private var liveScrollPermille: Int = 0
     private var hasInitialized = false
     private var lastRenderedPageIndex = -1
     private var lastRenderedRotation = -1
@@ -192,12 +222,14 @@ class PdfReaderViewModel(
     private var extractionJob: Job? = null
     private var extractionCancelled = AtomicBoolean(false)
     private var lookupJob: Job? = null
+    private var scrollSaveJob: Job? = null
 
     override fun onScreenShow(screen: SimpleLightScreen<Unit>) {
         super.onScreenShow(screen)
         viewModelScope.launch {
             _progressMode.value = repository.getProgressModeSync()
             _fontSize.value = repository.getFontSizeSync()
+            _pageMode.value = repository.getPageModeSync()
             _lookupEnabled.value = repository.isAnyDictionaryReadySync()
         }
         if (!hasInitialized) {
@@ -206,25 +238,42 @@ class PdfReaderViewModel(
                 val autoInvert = repository.getPdfDarkInvertSync()
                 _invertColors.value = autoInvert && LightThemeController.isDarkTheme
                 _rotationDegrees.value = repository.getPdfRotationSync(bookId)
-                val savedPage = repository.getProgressSync(bookId)?.currentPosition ?: 0
+                val savedProg = repository.getProgressSync(bookId)
+                val savedPage = savedProg?.currentPosition ?: 0
                 val startPage = explicitStartPage ?: savedPage
+                val startPermille = when {
+                    explicitStartScrollPermille != null -> explicitStartScrollPermille.coerceIn(0, 1000)
+                    explicitStartPage == null && savedProg != null -> savedProg.scrollIndex.coerceIn(0, 1000)
+                    else -> 0
+                }
 
                 val savedMode = repository.getPdfExtractionModeSync(bookId)
                 _extractionMode.value = savedMode
-                val wantTextMode = repository.getPdfTextModeSync(bookId)
+                val wantTextMode = repository.getPdfTextModeSync(bookId) ||
+                    (explicitStartScrollPermille != null && explicitStartScrollPermille > 0)
                 if (wantTextMode) {
                     val cached = repository.getCachedPdfTextSync(bookId, savedMode)
                     if (cached != null) {
                         _extractedBook.value = cached
                         _isTextMode.value = true
                         _isLoading.value = false
-                        openTextPage(startPage, cached)
+                        openTextPage(
+                            index = startPage,
+                            book = cached,
+                            explicitScrollPermille = startPermille,
+                            rememberOutgoing = false,
+                        )
                         return@launch
                     } else {
-                        // Cache was from an older extractor version — re-extract cleanly in place!
                         _pageIndex.value = startPage
+                        liveScrollPermille = startPermille
+                        _targetScrollPermille.value = startPermille
                         _isLoading.value = false
-                        enterTextMode(forceReextract = true, mode = savedMode)
+                        enterTextMode(
+                            forceReextract = true,
+                            mode = savedMode,
+                            targetScrollPermilleOverride = startPermille,
+                        )
                         return@launch
                     }
                 }
@@ -233,7 +282,17 @@ class PdfReaderViewModel(
         }
     }
 
-    private fun observeBookmarkAndSaveProgress(safeIndex: Int, totalPages: Int) {
+    fun onTextScrollChanged(scrollPermille: Int) {
+        val clamped = scrollPermille.coerceIn(0, 1000)
+        liveScrollPermille = clamped
+        scrollSaveJob?.cancel()
+        scrollSaveJob = viewModelScope.launch {
+            delay(500L)
+            repository.updateScrollProgress(bookId, clamped)
+        }
+    }
+
+    private fun observeBookmarksAndSaveProgress(safeIndex: Int, totalPages: Int, scrollPermille: Int) {
         viewModelScope.launch {
             repository.saveProgress(
                 bookId = bookId,
@@ -242,29 +301,63 @@ class PdfReaderViewModel(
                 format = BookFormat.PDF,
                 positionIndex = safeIndex,
                 totalPositions = totalPages,
+                scrollIndex = scrollPermille.coerceIn(0, 1000),
             )
         }
         bookmarkJob?.cancel()
         bookmarkJob = viewModelScope.launch {
-            repository.isPositionBookmarked(bookId, safeIndex).collect { saved ->
-                _isBookmarked.value = saved
+            repository.getBookmarksForPosition(bookId, safeIndex).collect { saved ->
+                _pageBookmarks.value = saved
             }
         }
     }
 
-    private fun openTextPage(index: Int, book: CachedPdfTextBook) {
+    private fun openTextPage(
+        index: Int,
+        book: CachedPdfTextBook,
+        explicitScrollPermille: Int? = null,
+        rememberOutgoing: Boolean = true,
+    ) {
         val total = book.pageCount.coerceAtLeast(1)
         val safeIndex = index.coerceIn(0, total - 1)
+        val now = System.currentTimeMillis()
+        if (rememberOutgoing) {
+            val prevIdx = _pageIndex.value
+            if (prevIdx != safeIndex) {
+                recentScrollPositions[prevIdx] = liveScrollPermille to now
+            }
+        }
+
+        val resolvedPermille = when {
+            explicitScrollPermille != null -> explicitScrollPermille.coerceIn(0, 1000)
+            else -> {
+                val recent = recentScrollPositions[safeIndex]
+                if (recent != null && (now - recent.second) <= PDF_BRIEF_SCROLL_MEMORY_MS) {
+                    recent.first.coerceIn(0, 1000)
+                } else {
+                    0
+                }
+            }
+        }
+
         _pageIndex.value = safeIndex
         _pageCount.value = total
+        liveScrollPermille = resolvedPermille
+        _targetScrollPermille.value = resolvedPermille
+        _scrollRequestToken.value = _scrollRequestToken.value + 1L
         _errorText.value = null
-        observeBookmarkAndSaveProgress(safeIndex, total)
+        dismissLookup()
+        observeBookmarksAndSaveProgress(safeIndex, total, resolvedPermille)
     }
 
-    fun openPage(index: Int, rotation: Int = _rotationDegrees.value) {
+    fun openPage(
+        index: Int,
+        rotation: Int = _rotationDegrees.value,
+        explicitScrollPermille: Int? = null,
+    ) {
         val cached = _extractedBook.value
         if (_isTextMode.value && cached != null) {
-            openTextPage(index, cached)
+            openTextPage(index, cached, explicitScrollPermille = explicitScrollPermille)
             return
         }
 
@@ -291,7 +384,9 @@ class PdfReaderViewModel(
                 _renderedPage.value = page
                 _pageIndex.value = safeIndex
                 _pageCount.value = page.pageCount
-                observeBookmarkAndSaveProgress(safeIndex, page.pageCount)
+                liveScrollPermille = 0
+                _targetScrollPermille.value = 0
+                observeBookmarksAndSaveProgress(safeIndex, page.pageCount, 0)
             }.onFailure { err ->
                 _errorText.value = err.message ?: "Unable to render PDF page."
             }
@@ -301,14 +396,21 @@ class PdfReaderViewModel(
     fun enterTextMode(
         forceReextract: Boolean = false,
         mode: PdfExtractionMode = _extractionMode.value,
+        targetScrollPermilleOverride: Int? = null,
     ) {
         _textNotice.value = null
         _extractionMode.value = mode
         val alreadyExtracted = _extractedBook.value
+        val desiredPermille = targetScrollPermilleOverride ?: liveScrollPermille
         if (!forceReextract && alreadyExtracted != null && alreadyExtracted.modeName == mode.name) {
             _isTextMode.value = true
             viewModelScope.launch { repository.setPdfTextMode(bookId, true) }
-            openTextPage(_pageIndex.value, alreadyExtracted)
+            openTextPage(
+                index = _pageIndex.value,
+                book = alreadyExtracted,
+                explicitScrollPermille = desiredPermille,
+                rememberOutgoing = false,
+            )
             return
         }
 
@@ -342,18 +444,26 @@ class PdfReaderViewModel(
                     _extractedBook.value = result.book
                     _isTextMode.value = true
                     repository.setPdfTextMode(bookId, true)
-                    openTextPage(_pageIndex.value, result.book)
+                    openTextPage(
+                        index = _pageIndex.value,
+                        book = result.book,
+                        explicitScrollPermille = desiredPermille,
+                        rememberOutgoing = false,
+                    )
                 }
                 PdfTextExtractionResult.Encrypted -> {
                     _textNotice.value =
                         "This PDF is encrypted, so its text cannot be extracted. You can still read it in Page view."
+                    if (_renderedPage.value == null) openPage(_pageIndex.value)
                 }
                 PdfTextExtractionResult.NoTextFound -> {
                     _textNotice.value =
                         "No embedded text found (this looks like a scanned image PDF). You can still read it in Page view."
+                    if (_renderedPage.value == null) openPage(_pageIndex.value)
                 }
                 is PdfTextExtractionResult.Error -> {
                     _textNotice.value = result.message
+                    if (_renderedPage.value == null) openPage(_pageIndex.value)
                 }
             }
         }
@@ -361,7 +471,7 @@ class PdfReaderViewModel(
 
     fun reextractWithMode(mode: PdfExtractionMode) {
         dismissLookup()
-        enterTextMode(forceReextract = true, mode = mode)
+        enterTextMode(forceReextract = true, mode = mode, targetScrollPermilleOverride = 0)
     }
 
     fun cancelTextExtraction() {
@@ -369,10 +479,14 @@ class PdfReaderViewModel(
         extractionJob?.cancel()
         _isExtractingText.value = false
         _extractionProgressText.value = null
+        if (_renderedPage.value == null && !_isTextMode.value) {
+            openPage(_pageIndex.value)
+        }
     }
 
     fun exitTextMode() {
         dismissLookup()
+        _isFullScreen.value = false
         _isTextMode.value = false
         viewModelScope.launch { repository.setPdfTextMode(bookId, false) }
         val targetPage = _pageIndex.value
@@ -444,16 +558,22 @@ class PdfReaderViewModel(
         _crispTile.value = null
     }
 
-    fun nextPage() {
+    fun nextPage(landOnStart: Boolean = false) {
         val total = _pageCount.value
         if (total > 0 && _pageIndex.value < total - 1) {
-            openPage(_pageIndex.value + 1)
+            openPage(
+                index = _pageIndex.value + 1,
+                explicitScrollPermille = if (landOnStart) 0 else null,
+            )
         }
     }
 
-    fun previousPage() {
+    fun previousPage(landOnEnd: Boolean = false) {
         if (_pageIndex.value > 0) {
-            openPage(_pageIndex.value - 1)
+            openPage(
+                index = _pageIndex.value - 1,
+                explicitScrollPermille = if (landOnEnd) 1000 else null,
+            )
         }
     }
 
@@ -461,19 +581,43 @@ class PdfReaderViewModel(
         val total = _pageCount.value
         if (total <= 0) return
         val target = (_pageIndex.value + delta).coerceIn(0, total - 1)
-        openPage(target)
+        openPage(target, explicitScrollPermille = 0)
     }
 
     fun toggleInvert() {
         _invertColors.value = !_invertColors.value
     }
 
-    fun cycleFontSize() {
+    fun cycleFontSize(preservePermille: Int = liveScrollPermille) {
+        val clamped = preservePermille.coerceIn(0, 1000)
         val next = _fontSize.value.next()
         _fontSize.value = next
+        liveScrollPermille = clamped
+        _targetScrollPermille.value = clamped
+        _scrollRequestToken.value = _scrollRequestToken.value + 1L
         viewModelScope.launch {
             repository.setFontSize(next)
         }
+    }
+
+    fun togglePageMode(preservePermille: Int = liveScrollPermille) {
+        val clamped = preservePermille.coerceIn(0, 1000)
+        val next = _pageMode.value.toggle()
+        _pageMode.value = next
+        liveScrollPermille = clamped
+        _targetScrollPermille.value = clamped
+        _scrollRequestToken.value = _scrollRequestToken.value + 1L
+        viewModelScope.launch {
+            repository.setPageMode(next)
+        }
+    }
+
+    fun toggleFullScreen(preservePermille: Int = liveScrollPermille) {
+        val clamped = preservePermille.coerceIn(0, 1000)
+        _isFullScreen.value = !_isFullScreen.value
+        liveScrollPermille = clamped
+        _targetScrollPermille.value = clamped
+        _scrollRequestToken.value = _scrollRequestToken.value + 1L
     }
 
     fun toggleProgressVisibility() {
@@ -488,25 +632,35 @@ class PdfReaderViewModel(
         }
     }
 
-    fun toggleBookmark() {
+    fun findBookmarkNear(scrollPermille: Int): BookBookmarkEntity? =
+        _pageBookmarks.value.minByOrNull { abs(it.scrollPermille - scrollPermille) }
+            ?.takeIf { abs(it.scrollPermille - scrollPermille) <= BOOKMARK_PROXIMITY_PERMILLE }
+
+    fun toggleBookmarkAt(scrollPermille: Int, visibleSnippet: String) {
         val total = _pageCount.value
         if (total <= 0) return
         val page = _pageIndex.value
-        val snippet = if (_isTextMode.value) {
-            _extractedBook.value?.pages?.getOrNull(page)?.blocks?.firstOrNull()?.text?.take(100)
-                ?: "PDF Bookmark"
+        val effectivePermille = if (_isTextMode.value) scrollPermille.coerceIn(0, 1000) else 0
+        val fallbackSnippet = if (_isTextMode.value) {
+            _extractedBook.value?.pages?.getOrNull(page)?.blocks?.firstOrNull { !it.isHeading }?.text
+                ?: _extractedBook.value?.pages?.getOrNull(page)?.blocks?.firstOrNull()?.text
+                ?: "PDF Page ${page + 1}"
         } else {
-            "PDF Bookmark"
+            "PDF Page ${page + 1}"
         }
+        val snippet = visibleSnippet.ifBlank { fallbackSnippet }
+        val matching = findBookmarkNear(effectivePermille)
+
         viewModelScope.launch {
-            repository.toggleBookmark(
+            repository.toggleScrollBookmark(
                 bookId = bookId,
                 bookTitle = bookTitle,
                 format = BookFormat.PDF,
                 positionIndex = page,
-                positionLabel = "Page ${page + 1} of $total",
+                chapterTitle = "Page ${page + 1} of $total",
+                scrollPermille = effectivePermille,
                 snippet = snippet,
-                currentlyBookmarked = _isBookmarked.value,
+                matchingBookmark = matching,
             )
         }
     }
@@ -535,6 +689,7 @@ class PdfReaderScreen(
     private val bookId: String,
     private val bookTitle: String,
     private val initialPage: Int? = null,
+    private val initialScrollPermille: Int? = null,
 ) : LightScreen<Unit, PdfReaderViewModel>(sealedActivity) {
 
     private val repository = ReaderRepository.getInstance(
@@ -553,18 +708,26 @@ class PdfReaderScreen(
     override val viewModelClass: Class<PdfReaderViewModel>
         get() = PdfReaderViewModel::class.java
 
-    override fun createViewModel() = PdfReaderViewModel(bookId, bookTitle, initialPage, repository)
+    override fun createViewModel() = PdfReaderViewModel(
+        bookId = bookId,
+        bookTitle = bookTitle,
+        explicitStartPage = initialPage,
+        explicitStartScrollPermille = initialScrollPermille,
+        repository = repository,
+    )
 
     @Composable
     override fun Content() {
         val themeColors by LightThemeController.colors.collectAsState()
         val pageIndex by viewModel.pageIndex.collectAsState()
         val pageCount by viewModel.pageCount.collectAsState()
+        val targetScrollPermille by viewModel.targetScrollPermille.collectAsState()
+        val scrollRequestToken by viewModel.scrollRequestToken.collectAsState()
         val renderedPage by viewModel.renderedPage.collectAsState()
         val crispTile by viewModel.crispTile.collectAsState()
         val isLoading by viewModel.isLoading.collectAsState()
         val errorText by viewModel.errorText.collectAsState()
-        val isBookmarked by viewModel.isBookmarked.collectAsState()
+        val pageBookmarks by viewModel.pageBookmarks.collectAsState()
         val invertColors by viewModel.invertColors.collectAsState()
         val rotationDegrees by viewModel.rotationDegrees.collectAsState()
         val progressMode by viewModel.progressMode.collectAsState()
@@ -576,20 +739,177 @@ class PdfReaderScreen(
         val extractedBook by viewModel.extractedBook.collectAsState()
         val extractionMode by viewModel.extractionMode.collectAsState()
         val fontSize by viewModel.fontSize.collectAsState()
+        val pageMode by viewModel.pageMode.collectAsState()
+        val isFullScreen by viewModel.isFullScreen.collectAsState()
         val lookupEnabled by viewModel.lookupEnabled.collectAsState()
         val isLookingUp by viewModel.isLookingUp.collectAsState()
         val lookupResult by viewModel.lookupResult.collectAsState()
 
         val density = LocalDensity.current
         val haptics = LocalHapticFeedback.current
+        val edgeBackThresholdPx = with(density) { 44.dp.toPx() }
         var showJumpBar by remember { mutableStateOf(false) }
         var showExtractPanel by remember { mutableStateOf(false) }
         var boxSize by remember { mutableStateOf(IntSize.Zero) }
 
+        val textPage = extractedBook?.pages?.getOrNull(pageIndex)
         val textScrollState = rememberScrollState()
-        LaunchedEffect(pageIndex, isTextMode) {
-            if (isTextMode) {
+        val blockOffsets = remember(pageIndex, fontSize, isTextMode) { mutableStateMapOf<Int, Int>() }
+
+        val textVariant = when (fontSize) {
+            ReaderFontSize.COMPACT -> LightTextVariant.Detail
+            ReaderFontSize.REGULAR -> LightTextVariant.Paragraph
+            ReaderFontSize.LARGE -> LightTextVariant.Copy
+        }
+
+        val textMeasurer = rememberTextMeasurer()
+        val bodyStyle = scaledReaderStyle(textVariant)
+        val headingStyle = scaledReaderStyle(LightTextVariant.Subheading)
+        val horizontalPadDp = 1.5f.gridUnitsAsDp()
+        val horizontalPadPx = with(density) { horizontalPadDp.roundToPx() }
+        val verticalPagePadPx = with(density) { (if (isFullScreen) 24.dp else 12.dp).roundToPx() }
+        var textViewportSize by remember { mutableStateOf(IntSize.Zero) }
+
+        val textBlocks = remember(textPage) {
+            textPage?.blocks?.map { TextBlock(text = it.text, isHeading = it.isHeading, isQuote = false) }.orEmpty()
+        }
+
+        val pagedPages = remember(
+            textBlocks,
+            isTextMode,
+            pageMode,
+            bodyStyle,
+            headingStyle,
+            textViewportSize,
+            horizontalPadPx,
+            verticalPagePadPx,
+        ) {
+            if (!isTextMode || pageMode != ReaderPageMode.PAGED || textBlocks.isEmpty() ||
+                textViewportSize.width <= 0 || textViewportSize.height <= 0
+            ) {
+                emptyList()
+            } else {
+                EReaderPaginator.paginateBlocks(
+                    blocks = textBlocks,
+                    textMeasurer = textMeasurer,
+                    bodyStyle = bodyStyle,
+                    headingStyle = headingStyle,
+                    viewportWidthPx = (textViewportSize.width - horizontalPadPx * 2).coerceAtLeast(100),
+                    viewportHeightPx = (textViewportSize.height - verticalPagePadPx).coerceAtLeast(100),
+                    density = density,
+                )
+            }
+        }
+
+        var currentSubPageIndex by remember(pageIndex) { mutableIntStateOf(0) }
+        val safeSubPageIndex = if (pagedPages.isEmpty()) 0 else currentSubPageIndex.coerceIn(0, pagedPages.lastIndex)
+
+        val scrollModePermille by remember(textScrollState) {
+            derivedStateOf {
+                val max = textScrollState.maxValue
+                if (max <= 0) 0 else ((textScrollState.value.toFloat() / max.toFloat()) * 1000f).roundToInt().coerceIn(0, 1000)
+            }
+        }
+
+        val activeTextPermille = when {
+            !isTextMode -> 0
+            pageMode == ReaderPageMode.PAGED -> pagedPages.getOrNull(safeSubPageIndex)?.permilleStart ?: targetScrollPermille
+            else -> scrollModePermille
+        }
+
+        val isNearSavedBookmark = remember(pageBookmarks, isTextMode, activeTextPermille) {
+            val target = if (isTextMode) activeTextPermille else 0
+            pageBookmarks.any { abs(it.scrollPermille - target) <= BOOKMARK_PROXIMITY_PERMILLE }
+        }
+
+        // Restore exact scroll target in PDF Text SCROLL mode
+        LaunchedEffect(pageIndex, scrollRequestToken, isTextMode, pageMode, textPage != null) {
+            if (!isTextMode || pageMode != ReaderPageMode.SCROLL || textPage == null) return@LaunchedEffect
+            val target = targetScrollPermille
+            if (target <= 0) {
                 textScrollState.scrollTo(0)
+            } else {
+                val maxVal = if (textScrollState.maxValue > 0) {
+                    textScrollState.maxValue
+                } else {
+                    withTimeoutOrNull(800L) {
+                        snapshotFlow { textScrollState.maxValue }.first { it > 0 }
+                    } ?: textScrollState.maxValue
+                }
+                val targetPx = ((target / 1000f) * maxVal).roundToInt().coerceIn(0, maxVal)
+                textScrollState.scrollTo(targetPx)
+            }
+        }
+
+        // Restore exact sub-page in PDF Text PAGED mode
+        LaunchedEffect(pageIndex, scrollRequestToken, isTextMode, pageMode, pagedPages) {
+            if (!isTextMode || pageMode != ReaderPageMode.PAGED || pagedPages.isEmpty()) return@LaunchedEffect
+            currentSubPageIndex = EReaderPaginator.pageIndexForPermille(pagedPages, targetScrollPermille)
+        }
+
+        // Persist scroll position in PDF Text SCROLL mode
+        LaunchedEffect(pageIndex, isTextMode, pageMode, textScrollState) {
+            if (!isTextMode || pageMode != ReaderPageMode.SCROLL) return@LaunchedEffect
+            snapshotFlow { scrollModePermille }
+                .distinctUntilChanged()
+                .collect { permille ->
+                    viewModel.onTextScrollChanged(permille)
+                }
+        }
+
+        // Persist sub-page position in PDF Text PAGED mode
+        LaunchedEffect(pageIndex, isTextMode, pageMode, safeSubPageIndex, pagedPages) {
+            if (!isTextMode || pageMode != ReaderPageMode.PAGED || pagedPages.isEmpty()) return@LaunchedEffect
+            val permille = pagedPages.getOrNull(safeSubPageIndex)?.permilleStart ?: 0
+            viewModel.onTextScrollChanged(permille)
+        }
+
+        fun findVisibleTextSnippet(): String {
+            if (!isTextMode) return "PDF Page ${pageIndex + 1}"
+            if (pageMode == ReaderPageMode.PAGED) {
+                return pagedPages.getOrNull(safeSubPageIndex)?.previewSnippet.orEmpty()
+            }
+            val blocks = textPage?.blocks.orEmpty()
+            if (blocks.isEmpty()) return ""
+            val scrollY = textScrollState.value
+            val bestIdx = blockOffsets.entries
+                .filter { it.value <= scrollY + 48 }
+                .maxByOrNull { it.value }
+                ?.key
+                ?: blockOffsets.entries.minByOrNull { abs(it.value - scrollY) }?.key
+                ?: ((scrollModePermille / 1000f) * blocks.lastIndex).roundToInt()
+                    .coerceIn(0, blocks.lastIndex)
+            return blocks.getOrNull(bestIdx)?.text.orEmpty()
+        }
+
+        val hasPrev = pageIndex > 0
+        val hasNext = pageCount > 0 && pageIndex < pageCount - 1
+
+        fun turnNextInTextMode() {
+            if (pageMode == ReaderPageMode.PAGED) {
+                if (safeSubPageIndex < pagedPages.lastIndex) {
+                    currentSubPageIndex = safeSubPageIndex + 1
+                } else if (hasNext) {
+                    viewModel.nextPage(landOnStart = true)
+                }
+            } else if (hasNext) {
+                viewModel.nextPage()
+            }
+        }
+
+        fun turnPrevInTextMode() {
+            if (pageMode == ReaderPageMode.PAGED) {
+                if (safeSubPageIndex > 0) {
+                    currentSubPageIndex = safeSubPageIndex - 1
+                } else if (hasPrev) {
+                    viewModel.previousPage(landOnEnd = true)
+                } else {
+                    goBack()
+                }
+            } else if (hasPrev) {
+                viewModel.previousPage()
+            } else {
+                goBack()
             }
         }
 
@@ -685,11 +1005,14 @@ class PdfReaderScreen(
         val liveFitWidthScale = rememberUpdatedState(fitWidthScale)
         val livePageIndex = rememberUpdatedState(pageIndex)
         val livePageCount = rememberUpdatedState(pageCount)
+        val liveActiveTextPermille by rememberUpdatedState(activeTextPermille)
+        val liveTurnNextText by rememberUpdatedState(::turnNextInTextMode)
+        val liveTurnPrevText by rememberUpdatedState(::turnPrevInTextMode)
 
         val contentColor = LightThemeTokens.colors.content
         val bookmarkPainter = rememberVectorPainter(
-            remember(isBookmarked, contentColor) {
-                if (isBookmarked) createBookmarkFilledVector(contentColor)
+            remember(isNearSavedBookmark, contentColor) {
+                if (isNearSavedBookmark) createBookmarkFilledVector(contentColor)
                 else createBookmarkOutlineVector(contentColor)
             }
         )
@@ -702,15 +1025,8 @@ class PdfReaderScreen(
             else -> String.format(Locale.US, "%.1fx", scale)
         }
 
-        val textVariant = when (fontSize) {
-            ReaderFontSize.COMPACT -> LightTextVariant.Detail
-            ReaderFontSize.REGULAR -> LightTextVariant.Paragraph
-            ReaderFontSize.LARGE -> LightTextVariant.Copy
-        }
-
         val isOverlayOpen = isLookingUp || lookupResult != null
-        val hasPrev = pageIndex > 0
-        val hasNext = pageCount > 0 && pageIndex < pageCount - 1
+        val hideChrome = isTextMode && isFullScreen && !isExtractingText
 
         LightTheme(colors = themeColors) {
             Box(
@@ -719,233 +1035,246 @@ class PdfReaderScreen(
                     .background(LightThemeTokens.colors.background),
             ) {
                 Column(modifier = Modifier.fillMaxSize()) {
-                    LightTopBar(
-                        leftButton = LightBarButton.LightIcon(
-                            icon = LightIcons.BACK,
-                            onClick = { goBack() },
-                        ),
-                        center = LightTopBarCenter.Text(bookTitle),
-                        rightButton = LightBarButton.Icon(
-                            painter = bookmarkPainter,
-                            contentDescription = if (isBookmarked) "Bookmarked" else "Bookmark",
-                            onClick = { viewModel.toggleBookmark() },
-                        ),
-                        modifier = Modifier.padding(bottom = 0.25f.gridUnitsAsDp()),
-                    )
-
-                    // Top PDF Control Strip
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 1.0f.gridUnitsAsDp(), vertical = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        val pageLabel = if (pageCount > 0) "P. ${pageIndex + 1}/$pageCount" else "Loading..."
-                        Box(
-                            modifier = Modifier
-                                .border(
-                                    width = 1.dp,
-                                    color = LightThemeTokens.colors.content.copy(alpha = 0.45f),
-                                    shape = RoundedCornerShape(4.dp),
-                                )
-                                .lightClickable { showJumpBar = !showJumpBar }
-                                .padding(horizontal = 6.dp, vertical = 3.dp),
-                        ) {
-                            LightText(text = pageLabel, variant = LightTextVariant.Detail)
-                        }
-
-                        Spacer(modifier = Modifier.weight(1f))
-
-                        if (isTextMode) {
-                            PdfControlChip(
-                                label = "Page",
-                                highlighted = false,
+                    if (!hideChrome) {
+                        LightTopBar(
+                            leftButton = LightBarButton.LightIcon(
+                                icon = LightIcons.BACK,
+                                onClick = { goBack() },
+                            ),
+                            center = LightTopBarCenter.Text(bookTitle),
+                            rightButton = LightBarButton.Icon(
+                                painter = bookmarkPainter,
+                                contentDescription = if (isNearSavedBookmark) "Bookmarked here" else "Bookmark this spot",
                                 onClick = {
-                                    showExtractPanel = false
-                                    viewModel.exitTextMode()
+                                    viewModel.toggleBookmarkAt(
+                                        scrollPermille = activeTextPermille,
+                                        visibleSnippet = findVisibleTextSnippet(),
+                                    )
                                 },
-                            )
-                            Spacer(modifier = Modifier.width(5.dp))
-                            PdfControlChip(
-                                label = "Fix",
-                                highlighted = showExtractPanel,
-                                onClick = {
-                                    showExtractPanel = !showExtractPanel
-                                    if (showExtractPanel) showJumpBar = false
-                                },
-                            )
-                            Spacer(modifier = Modifier.width(5.dp))
-                            PdfControlChip(
-                                label = fontSize.displayLabel,
-                                highlighted = false,
-                                onClick = { viewModel.cycleFontSize() },
-                            )
-                        } else {
-                            PdfControlChip(
-                                label = "Text",
-                                highlighted = isExtractingText,
-                                onClick = { viewModel.enterTextMode() },
-                            )
-                            Spacer(modifier = Modifier.width(3.dp))
-                            PdfControlChip(
-                                label = "−",
-                                highlighted = false,
-                                onClick = { applyCenteredZoom(scale / 1.35f) },
-                            )
-                            Spacer(modifier = Modifier.width(3.dp))
-                            PdfControlChip(
-                                label = zoomBadgeLabel,
-                                highlighted = !isAtFitPage && !isAtFitWidth,
-                                onClick = {
-                                    if (isAtFitWidth) resetToFitPage() else resetToFitWidthTop()
-                                },
-                            )
-                            Spacer(modifier = Modifier.width(3.dp))
-                            PdfControlChip(
-                                label = "+",
-                                highlighted = false,
-                                onClick = { applyCenteredZoom(scale * 1.35f) },
-                            )
-                            Spacer(modifier = Modifier.width(3.dp))
-                            PdfControlChip(
-                                label = if (rotationDegrees == 0) "↻" else "${rotationDegrees}°",
-                                highlighted = rotationDegrees != 0,
-                                onClick = { viewModel.rotateClockwise() },
-                            )
-                            Spacer(modifier = Modifier.width(3.dp))
-                            PdfControlChip(
-                                label = "Inv",
-                                highlighted = invertColors,
-                                onClick = { viewModel.toggleInvert() },
-                            )
-                        }
-                    }
+                            ),
+                            modifier = Modifier.padding(bottom = 0.25f.gridUnitsAsDp()),
+                        )
 
-                    // Text Extraction Retry & Layout Mode Panel (for boxes, sidebars & proofreading)
-                    if (isTextMode && showExtractPanel && !isExtractingText) {
-                        Column(
+                        // Top PDF Control Strip
+                        Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(horizontal = 1.0f.gridUnitsAsDp(), vertical = 4.dp)
-                                .border(
-                                    width = 1.dp,
-                                    color = LightThemeTokens.colors.content.copy(alpha = 0.45f),
-                                    shape = RoundedCornerShape(6.dp),
-                                )
-                                .padding(horizontal = 10.dp, vertical = 8.dp),
-                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                                .padding(horizontal = 1.0f.gridUnitsAsDp(), vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                            ) {
-                                LightText(
-                                    text = "Text Layout: ${extractionMode.displayName}",
-                                    variant = LightTextVariant.Detail,
-                                )
-                                LightText(
-                                    text = "✕",
-                                    variant = LightTextVariant.Detail,
-                                    modifier = Modifier
-                                        .lightClickable { showExtractPanel = false }
-                                        .padding(horizontal = 4.dp),
-                                )
-                            }
-                            LightText(
-                                text = extractionMode.description,
-                                variant = LightTextVariant.Detail,
-                                lighten = true,
-                            )
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                            ) {
-                                PdfExtractionMode.entries.forEach { mode ->
-                                    PdfControlChip(
-                                        label = mode.shortLabel,
-                                        highlighted = mode == extractionMode,
-                                        onClick = {
-                                            showExtractPanel = false
-                                            viewModel.reextractWithMode(mode)
-                                        },
+                            val pageLabel = if (pageCount > 0) "P. ${pageIndex + 1}/$pageCount" else "Loading..."
+                            Box(
+                                modifier = Modifier
+                                    .border(
+                                        width = 1.dp,
+                                        color = LightThemeTokens.colors.content.copy(alpha = 0.45f),
+                                        shape = RoundedCornerShape(4.dp),
                                     )
-                                }
-                            }
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    .lightClickable { showJumpBar = !showJumpBar }
+                                    .padding(horizontal = 6.dp, vertical = 3.dp),
                             ) {
+                                LightText(text = pageLabel, variant = LightTextVariant.Detail)
+                            }
+
+                            Spacer(modifier = Modifier.weight(1f))
+
+                            if (isTextMode) {
                                 PdfControlChip(
-                                    label = "Retry Extract",
-                                    highlighted = false,
-                                    onClick = {
-                                        showExtractPanel = false
-                                        viewModel.reextractWithMode(extractionMode)
-                                    },
-                                )
-                                PdfControlChip(
-                                    label = "Compare PDF Page",
+                                    label = "Page",
                                     highlighted = false,
                                     onClick = {
                                         showExtractPanel = false
                                         viewModel.exitTextMode()
                                     },
                                 )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                PdfControlChip(
+                                    label = pageMode.chipLabel,
+                                    highlighted = pageMode == ReaderPageMode.PAGED,
+                                    onClick = { viewModel.togglePageMode(activeTextPermille) },
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                PdfControlChip(
+                                    label = "Fix",
+                                    highlighted = showExtractPanel,
+                                    onClick = {
+                                        showExtractPanel = !showExtractPanel
+                                        if (showExtractPanel) showJumpBar = false
+                                    },
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                PdfControlChip(
+                                    label = fontSize.displayLabel,
+                                    highlighted = false,
+                                    onClick = { viewModel.cycleFontSize(activeTextPermille) },
+                                )
+                            } else {
+                                PdfControlChip(
+                                    label = "Text",
+                                    highlighted = isExtractingText,
+                                    onClick = { viewModel.enterTextMode() },
+                                )
+                                Spacer(modifier = Modifier.width(3.dp))
+                                PdfControlChip(
+                                    label = "−",
+                                    highlighted = false,
+                                    onClick = { applyCenteredZoom(scale / 1.35f) },
+                                )
+                                Spacer(modifier = Modifier.width(3.dp))
+                                PdfControlChip(
+                                    label = zoomBadgeLabel,
+                                    highlighted = !isAtFitPage && !isAtFitWidth,
+                                    onClick = {
+                                        if (isAtFitWidth) resetToFitPage() else resetToFitWidthTop()
+                                    },
+                                )
+                                Spacer(modifier = Modifier.width(3.dp))
+                                PdfControlChip(
+                                    label = "+",
+                                    highlighted = false,
+                                    onClick = { applyCenteredZoom(scale * 1.35f) },
+                                )
+                                Spacer(modifier = Modifier.width(3.dp))
+                                PdfControlChip(
+                                    label = if (rotationDegrees == 0) "↻" else "${rotationDegrees}°",
+                                    highlighted = rotationDegrees != 0,
+                                    onClick = { viewModel.rotateClockwise() },
+                                )
+                                Spacer(modifier = Modifier.width(3.dp))
+                                PdfControlChip(
+                                    label = "Inv",
+                                    highlighted = invertColors,
+                                    onClick = { viewModel.toggleInvert() },
+                                )
                             }
                         }
-                    }
 
-                    // Optional Quick Page Jump Bar
-                    if (showJumpBar && pageCount > 1) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 1.0f.gridUnitsAsDp(), vertical = 4.dp),
-                            horizontalArrangement = Arrangement.spacedBy(5.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            PdfControlChip("First", false) { viewModel.openPage(0) }
-                            PdfControlChip("-10", false) { viewModel.jumpRelative(-10) }
-                            PdfControlChip("-1", false) { viewModel.jumpRelative(-1) }
-                            PdfControlChip("+1", false) { viewModel.jumpRelative(1) }
-                            PdfControlChip("+10", false) { viewModel.jumpRelative(10) }
-                            PdfControlChip("Last", false) { viewModel.openPage(pageCount - 1) }
-                        }
-                    }
-
-                    // Friendly dismissible notice if PDF has no selectable text or is encrypted
-                    if (textNotice != null) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 1.0f.gridUnitsAsDp(), vertical = 4.dp)
-                                .border(
-                                    width = 1.dp,
-                                    color = LightThemeTokens.colors.content.copy(alpha = 0.5f),
-                                    shape = RoundedCornerShape(6.dp),
-                                )
-                                .padding(horizontal = 10.dp, vertical = 7.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            LightText(
-                                text = textNotice.orEmpty(),
-                                variant = LightTextVariant.Detail,
-                                modifier = Modifier.weight(1f),
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            LightText(
-                                text = "OK",
-                                variant = LightTextVariant.Detail,
+                        // Text Extraction Retry & Layout Mode Panel (for boxes, sidebars & proofreading)
+                        if (isTextMode && showExtractPanel && !isExtractingText) {
+                            Column(
                                 modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 1.0f.gridUnitsAsDp(), vertical = 4.dp)
                                     .border(
                                         width = 1.dp,
-                                        color = LightThemeTokens.colors.content.copy(alpha = 0.55f),
-                                        shape = RoundedCornerShape(4.dp),
+                                        color = LightThemeTokens.colors.content.copy(alpha = 0.45f),
+                                        shape = RoundedCornerShape(6.dp),
                                     )
-                                    .lightClickable { viewModel.dismissTextNotice() }
-                                    .padding(horizontal = 8.dp, vertical = 3.dp),
-                            )
+                                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                ) {
+                                    LightText(
+                                        text = "Text Layout: ${extractionMode.displayName}",
+                                        variant = LightTextVariant.Detail,
+                                    )
+                                    LightText(
+                                        text = "✕",
+                                        variant = LightTextVariant.Detail,
+                                        modifier = Modifier
+                                            .lightClickable { showExtractPanel = false }
+                                            .padding(horizontal = 4.dp),
+                                    )
+                                }
+                                LightText(
+                                    text = extractionMode.description,
+                                    variant = LightTextVariant.Detail,
+                                    lighten = true,
+                                )
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                ) {
+                                    PdfExtractionMode.entries.forEach { mode ->
+                                        PdfControlChip(
+                                            label = mode.shortLabel,
+                                            highlighted = mode == extractionMode,
+                                            onClick = {
+                                                showExtractPanel = false
+                                                viewModel.reextractWithMode(mode)
+                                            },
+                                        )
+                                    }
+                                }
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                ) {
+                                    PdfControlChip(
+                                        label = "Retry Extract",
+                                        highlighted = false,
+                                        onClick = {
+                                            showExtractPanel = false
+                                            viewModel.reextractWithMode(extractionMode)
+                                        },
+                                    )
+                                    PdfControlChip(
+                                        label = "Compare PDF Page",
+                                        highlighted = false,
+                                        onClick = {
+                                            showExtractPanel = false
+                                            viewModel.exitTextMode()
+                                        },
+                                    )
+                                }
+                            }
+                        }
+
+                        // Optional Quick Page Jump Bar
+                        if (showJumpBar && pageCount > 1) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 1.0f.gridUnitsAsDp(), vertical = 4.dp),
+                                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                PdfControlChip("First", false) { viewModel.openPage(0, explicitScrollPermille = 0) }
+                                PdfControlChip("-10", false) { viewModel.jumpRelative(-10) }
+                                PdfControlChip("-1", false) { viewModel.jumpRelative(-1) }
+                                PdfControlChip("+1", false) { viewModel.jumpRelative(1) }
+                                PdfControlChip("+10", false) { viewModel.jumpRelative(10) }
+                                PdfControlChip("Last", false) { viewModel.openPage(pageCount - 1, explicitScrollPermille = 0) }
+                            }
+                        }
+
+                        // Friendly dismissible notice if PDF has no selectable text or is encrypted
+                        if (textNotice != null) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 1.0f.gridUnitsAsDp(), vertical = 4.dp)
+                                    .border(
+                                        width = 1.dp,
+                                        color = LightThemeTokens.colors.content.copy(alpha = 0.5f),
+                                        shape = RoundedCornerShape(6.dp),
+                                    )
+                                    .padding(horizontal = 10.dp, vertical = 7.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                LightText(
+                                    text = textNotice.orEmpty(),
+                                    variant = LightTextVariant.Detail,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                LightText(
+                                    text = "OK",
+                                    variant = LightTextVariant.Detail,
+                                    modifier = Modifier
+                                        .border(
+                                            width = 1.dp,
+                                            color = LightThemeTokens.colors.content.copy(alpha = 0.55f),
+                                            shape = RoundedCornerShape(4.dp),
+                                        )
+                                        .lightClickable { viewModel.dismissTextNotice() }
+                                        .padding(horizontal = 8.dp, vertical = 3.dp),
+                                )
+                            }
                         }
                     }
 
@@ -987,13 +1316,13 @@ class PdfReaderScreen(
                         isTextMode -> {
                             var dragAccumulator by remember(pageIndex) { mutableFloatStateOf(0f) }
                             var dragStartX by remember(pageIndex) { mutableFloatStateOf(0f) }
-                            val textPage = extractedBook?.pages?.getOrNull(pageIndex)
 
                             Box(
                                 modifier = Modifier
                                     .weight(1f)
                                     .fillMaxWidth()
-                                    .pointerInput(pageIndex, isOverlayOpen, hasPrev, hasNext) {
+                                    .onSizeChanged { textViewportSize = it }
+                                    .pointerInput(pageIndex, isOverlayOpen) {
                                         if (isOverlayOpen) return@pointerInput
                                         detectHorizontalDragGestures(
                                             onDragStart = { offset ->
@@ -1002,19 +1331,27 @@ class PdfReaderScreen(
                                             },
                                             onDragEnd = {
                                                 if (dragAccumulator > 70f) {
-                                                    if (dragStartX <= 260f || !hasPrev) {
+                                                    if (dragStartX <= edgeBackThresholdPx) {
                                                         goBack()
                                                     } else {
-                                                        viewModel.previousPage()
+                                                        liveTurnPrevText()
                                                     }
-                                                } else if (dragAccumulator < -80f && hasNext) {
-                                                    viewModel.nextPage()
+                                                } else if (dragAccumulator < -80f) {
+                                                    liveTurnNextText()
                                                 }
                                                 dragAccumulator = 0f
                                             },
                                             onDragCancel = { dragAccumulator = 0f },
                                             onHorizontalDrag = { _, dragAmount ->
                                                 dragAccumulator += dragAmount
+                                            },
+                                        )
+                                    }
+                                    .pointerInput(isOverlayOpen) {
+                                        if (isOverlayOpen) return@pointerInput
+                                        detectTapGestures(
+                                            onDoubleTap = {
+                                                viewModel.toggleFullScreen(liveActiveTextPermille)
                                             },
                                         )
                                     },
@@ -1053,24 +1390,75 @@ class PdfReaderScreen(
                                             }
                                         }
                                     }
+                                } else if (pageMode == ReaderPageMode.PAGED) {
+                                    val currentSubPage = pagedPages.getOrNull(safeSubPageIndex)
+                                    Column(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .padding(
+                                                horizontal = horizontalPadDp,
+                                                vertical = if (isFullScreen) 12.dp else 6.dp,
+                                            ),
+                                    ) {
+                                        currentSubPage?.slices?.forEach { slice ->
+                                            if (slice.isHeading) {
+                                                LightText(
+                                                    text = slice.text,
+                                                    variant = LightTextVariant.Subheading,
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .padding(
+                                                            top = if (slice.isContinuation) 2.dp else 10.dp,
+                                                            bottom = 6.dp,
+                                                        ),
+                                                )
+                                            } else {
+                                                LookupableReaderText(
+                                                    text = slice.text,
+                                                    variant = textVariant,
+                                                    lighten = false,
+                                                    lookupEnabled = lookupEnabled,
+                                                    onLongPressChar = { offset ->
+                                                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                        viewModel.lookupWordAt(slice.text, offset)
+                                                    },
+                                                    onDoubleTap = {
+                                                        viewModel.toggleFullScreen(liveActiveTextPermille)
+                                                    },
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .padding(
+                                                            top = if (slice.isContinuation) 2.dp else 4.dp,
+                                                            bottom = 10.dp,
+                                                        ),
+                                                )
+                                            }
+                                        }
+                                    }
                                 } else {
-                                    val rightPad = 1.5f.gridUnitsAsDp()
                                     LightScrollView(
                                         scrollState = textScrollState,
                                         modifier = Modifier
                                             .fillMaxSize()
-                                            .padding(start = 1.5f.gridUnitsAsDp()),
+                                            .padding(
+                                                start = horizontalPadDp,
+                                                top = if (isFullScreen) 10.dp else 0.dp,
+                                                bottom = if (isFullScreen) 10.dp else 0.dp,
+                                            ),
                                     ) {
                                         Spacer(modifier = Modifier.height(10.dp))
 
-                                        textPage.blocks.forEach { block ->
+                                        textPage.blocks.forEachIndexed { idx, block ->
+                                            val trackOffsetModifier = Modifier.onGloballyPositioned { coords ->
+                                                blockOffsets[idx] = coords.positionInParent().y.roundToInt()
+                                            }
                                             if (block.isHeading) {
                                                 LightText(
                                                     text = block.text,
                                                     variant = LightTextVariant.Subheading,
-                                                    modifier = Modifier
+                                                    modifier = trackOffsetModifier
                                                         .fillMaxWidth()
-                                                        .padding(end = rightPad, top = 12.dp, bottom = 8.dp),
+                                                        .padding(end = horizontalPadDp, top = 12.dp, bottom = 8.dp),
                                                 )
                                             } else {
                                                 LookupableReaderText(
@@ -1082,9 +1470,12 @@ class PdfReaderScreen(
                                                         haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                                                         viewModel.lookupWordAt(block.text, offset)
                                                     },
-                                                    modifier = Modifier
+                                                    onDoubleTap = {
+                                                        viewModel.toggleFullScreen(liveActiveTextPermille)
+                                                    },
+                                                    modifier = trackOffsetModifier
                                                         .fillMaxWidth()
-                                                        .padding(end = rightPad, top = 4.dp, bottom = 10.dp),
+                                                        .padding(end = horizontalPadDp, top = 4.dp, bottom = 10.dp),
                                                 )
                                             }
                                         }
@@ -1212,7 +1603,7 @@ class PdfReaderScreen(
                                                 val curMaxX = (((liveBaseW.value * curScale) - liveBoxW.value) / 2f).coerceAtLeast(0f)
                                                 if (curMaxX <= 2f && abs(totalDx) > 110f && abs(totalDx) > abs(totalDy) * 1.6f) {
                                                     if (totalDx > 0f) {
-                                                        if (startX <= 220f || livePageIndex.value == 0) {
+                                                        if (startX <= edgeBackThresholdPx || livePageIndex.value == 0) {
                                                             goBack()
                                                         } else {
                                                             viewModel.previousPage()
@@ -1282,48 +1673,83 @@ class PdfReaderScreen(
                         }
                     }
 
-                    // Bottom Page Navigation Bar (tap % to toggle Book % / Off)
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 1.5f.gridUnitsAsDp(), vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        if (hasPrev) {
-                            LightText(
-                                text = "← Prev",
-                                variant = LightTextVariant.Detail,
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .lightClickable { viewModel.previousPage() },
-                            )
-                        } else {
-                            Spacer(modifier = Modifier.weight(1f))
-                        }
+                    // Bottom Page Navigation Bar (hidden in Full Screen)
+                    if (!hideChrome) {
+                        val isTextPaged = isTextMode && pageMode == ReaderPageMode.PAGED && pagedPages.isNotEmpty()
+                        val canGoBack = if (isTextPaged) safeSubPageIndex > 0 || hasPrev else hasPrev
+                        val canGoForward = if (isTextPaged) safeSubPageIndex < pagedPages.lastIndex || hasNext else hasNext
 
-                        if (pageCount > 0) {
-                            val pct = (((pageIndex + 1).toFloat() / pageCount) * 100f).toInt().coerceIn(1, 100)
-                            val centerText = if (progressMode == ReaderProgressMode.HIDDEN) "•••" else "$pct%"
-                            LightText(
-                                text = centerText,
-                                variant = LightTextVariant.Detail,
-                                lighten = true,
-                                modifier = Modifier
-                                    .lightClickable { viewModel.toggleProgressVisibility() }
-                                    .padding(horizontal = 10.dp, vertical = 2.dp),
-                            )
-                        }
-
-                        Box(
-                            modifier = Modifier.weight(1f),
-                            contentAlignment = Alignment.CenterEnd,
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = horizontalPadDp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            if (hasNext) {
+                            if (canGoBack) {
                                 LightText(
-                                    text = "Next →",
+                                    text = "← Prev",
                                     variant = LightTextVariant.Detail,
-                                    modifier = Modifier.lightClickable { viewModel.nextPage() },
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .lightClickable {
+                                            if (isTextPaged) turnPrevInTextMode() else viewModel.previousPage()
+                                        },
                                 )
+                            } else {
+                                Spacer(modifier = Modifier.weight(1f))
+                            }
+
+                            if (isTextPaged) {
+                                val pct = if (pageCount > 0) {
+                                    (((pageIndex.toFloat() + (activeTextPermille / 1000f)) / pageCount) * 100f)
+                                        .roundToInt().coerceIn(0, 100)
+                                } else {
+                                    0
+                                }
+                                val centerText = if (progressMode == ReaderProgressMode.HIDDEN) {
+                                    "${safeSubPageIndex + 1}/${pagedPages.size}"
+                                } else {
+                                    "${safeSubPageIndex + 1}/${pagedPages.size} • $pct%"
+                                }
+                                LightText(
+                                    text = centerText,
+                                    variant = LightTextVariant.Detail,
+                                    lighten = true,
+                                    modifier = Modifier
+                                        .lightClickable { viewModel.toggleProgressVisibility() }
+                                        .padding(horizontal = 10.dp, vertical = 2.dp),
+                                )
+                            } else if (pageCount > 0) {
+                                val pct = if (isTextMode) {
+                                    (((pageIndex.toFloat() + (activeTextPermille / 1000f)) / pageCount) * 100f)
+                                        .roundToInt().coerceIn(0, 100)
+                                } else {
+                                    (((pageIndex + 1).toFloat() / pageCount) * 100f).toInt().coerceIn(1, 100)
+                                }
+                                val centerText = if (progressMode == ReaderProgressMode.HIDDEN) "•••" else "$pct%"
+                                LightText(
+                                    text = centerText,
+                                    variant = LightTextVariant.Detail,
+                                    lighten = true,
+                                    modifier = Modifier
+                                        .lightClickable { viewModel.toggleProgressVisibility() }
+                                        .padding(horizontal = 10.dp, vertical = 2.dp),
+                                )
+                            }
+
+                            Box(
+                                modifier = Modifier.weight(1f),
+                                contentAlignment = Alignment.CenterEnd,
+                            ) {
+                                if (canGoForward) {
+                                    LightText(
+                                        text = "Next →",
+                                        variant = LightTextVariant.Detail,
+                                        modifier = Modifier.lightClickable {
+                                            if (isTextPaged) turnNextInTextMode() else viewModel.nextPage()
+                                        },
+                                    )
+                                }
                             }
                         }
                     }
