@@ -2,7 +2,6 @@ package com.setholson.ereader.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -26,7 +25,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
@@ -578,45 +576,20 @@ class TextReaderScreen(
         )
 
         val haptics = LocalHapticFeedback.current
-        val edgeBackThresholdPx = with(density) { 44.dp.toPx() }
-        var dragAccumulator by remember(chapterIndex) { mutableFloatStateOf(0f) }
-        var dragStartX by remember(chapterIndex) { mutableFloatStateOf(0f) }
         val isOverlayOpen = isLookingUp || lookupResult != null
-
         val liveActivePermille by rememberUpdatedState(activeScrollPermille)
-        val liveTurnNext by rememberUpdatedState(::turnNextPageOrChapter)
-        val liveTurnPrev by rememberUpdatedState(::turnPrevPageOrChapter)
 
         LightTheme(colors = themeColors) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
                     .background(LightThemeTokens.colors.background)
-                    .pointerInput(chapterIndex, isOverlayOpen) {
-                        if (isOverlayOpen) return@pointerInput
-                        detectHorizontalDragGestures(
-                            onDragStart = { offset ->
-                                dragStartX = offset.x
-                                dragAccumulator = 0f
-                            },
-                            onDragEnd = {
-                                if (dragAccumulator > 70f) {
-                                    if (dragStartX <= edgeBackThresholdPx) {
-                                        goBack()
-                                    } else {
-                                        liveTurnPrev()
-                                    }
-                                } else if (dragAccumulator < -80f) {
-                                    liveTurnNext()
-                                }
-                                dragAccumulator = 0f
-                            },
-                            onDragCancel = { dragAccumulator = 0f },
-                            onHorizontalDrag = { _, dragAmount ->
-                                dragAccumulator += dragAmount
-                            },
-                        )
-                    },
+                    .readerHorizontalSwipes(
+                        enabled = !isOverlayOpen,
+                        onEdgeSwipeBack = { goBack() },
+                        onSwipeRight = { turnPrevPageOrChapter() },
+                        onSwipeLeft = { turnNextPageOrChapter() },
+                    ),
             ) {
                 Column(modifier = Modifier.fillMaxSize()) {
                     if (!isFullScreen) {

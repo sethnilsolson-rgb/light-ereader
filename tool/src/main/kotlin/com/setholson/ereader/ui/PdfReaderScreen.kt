@@ -9,7 +9,6 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculateCentroid
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
-import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -1006,8 +1005,6 @@ class PdfReaderScreen(
         val livePageIndex = rememberUpdatedState(pageIndex)
         val livePageCount = rememberUpdatedState(pageCount)
         val liveActiveTextPermille by rememberUpdatedState(activeTextPermille)
-        val liveTurnNextText by rememberUpdatedState(::turnNextInTextMode)
-        val liveTurnPrevText by rememberUpdatedState(::turnPrevInTextMode)
 
         val contentColor = LightThemeTokens.colors.content
         val bookmarkPainter = rememberVectorPainter(
@@ -1314,39 +1311,17 @@ class PdfReaderScreen(
                         }
 
                         isTextMode -> {
-                            var dragAccumulator by remember(pageIndex) { mutableFloatStateOf(0f) }
-                            var dragStartX by remember(pageIndex) { mutableFloatStateOf(0f) }
-
                             Box(
                                 modifier = Modifier
                                     .weight(1f)
                                     .fillMaxWidth()
                                     .onSizeChanged { textViewportSize = it }
-                                    .pointerInput(pageIndex, isOverlayOpen) {
-                                        if (isOverlayOpen) return@pointerInput
-                                        detectHorizontalDragGestures(
-                                            onDragStart = { offset ->
-                                                dragStartX = offset.x
-                                                dragAccumulator = 0f
-                                            },
-                                            onDragEnd = {
-                                                if (dragAccumulator > 70f) {
-                                                    if (dragStartX <= edgeBackThresholdPx) {
-                                                        goBack()
-                                                    } else {
-                                                        liveTurnPrevText()
-                                                    }
-                                                } else if (dragAccumulator < -80f) {
-                                                    liveTurnNextText()
-                                                }
-                                                dragAccumulator = 0f
-                                            },
-                                            onDragCancel = { dragAccumulator = 0f },
-                                            onHorizontalDrag = { _, dragAmount ->
-                                                dragAccumulator += dragAmount
-                                            },
-                                        )
-                                    }
+                                    .readerHorizontalSwipes(
+                                        enabled = !isOverlayOpen,
+                                        onEdgeSwipeBack = { goBack() },
+                                        onSwipeRight = { turnPrevInTextMode() },
+                                        onSwipeLeft = { turnNextInTextMode() },
+                                    )
                                     .pointerInput(isOverlayOpen) {
                                         if (isOverlayOpen) return@pointerInput
                                         detectTapGestures(
@@ -1601,9 +1576,13 @@ class PdfReaderScreen(
                                             if (!isMultiTouch && pastSlop && liveBoxW.value > 0f) {
                                                 val curScale = liveScale.value
                                                 val curMaxX = (((liveBaseW.value * curScale) - liveBoxW.value) / 2f).coerceAtLeast(0f)
-                                                if (curMaxX <= 2f && abs(totalDx) > 110f && abs(totalDx) > abs(totalDy) * 1.6f) {
+                                                val atLeftEdge = curMaxX <= 2f || liveOffsetX.value >= curMaxX - 2f
+                                                val isClearHorizontal = abs(totalDx) > 100f && abs(totalDx) > abs(totalDy) * 1.4f
+                                                if (isClearHorizontal && totalDx > 0f && startX <= edgeBackThresholdPx && atLeftEdge) {
+                                                    goBack()
+                                                } else if (curMaxX <= 2f && isClearHorizontal) {
                                                     if (totalDx > 0f) {
-                                                        if (startX <= edgeBackThresholdPx || livePageIndex.value == 0) {
+                                                        if (livePageIndex.value == 0) {
                                                             goBack()
                                                         } else {
                                                             viewModel.previousPage()
