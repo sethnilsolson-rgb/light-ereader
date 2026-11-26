@@ -193,7 +193,7 @@ class LibraryScreen(
                     .background(LightThemeTokens.colors.background)
             ) {
                 Column(modifier = Modifier.fillMaxSize()) {
-                    LightTopBar(
+                    BatteryTopBar(
                         leftButton = LightBarButton.LightIcon(
                             icon = LightIcons.ADD,
                             contentDescription = "Add Books",

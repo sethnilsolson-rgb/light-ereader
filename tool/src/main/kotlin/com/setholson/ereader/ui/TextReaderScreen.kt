@@ -233,7 +233,7 @@ class TextReaderViewModel(
         liveScrollPermille = clamped
         scrollSaveJob?.cancel()
         scrollSaveJob = viewModelScope.launch {
-            delay(500L)
+            delay(900L)
             repository.updateScrollProgress(bookId, clamped)
         }
     }
@@ -542,6 +542,22 @@ class TextReaderScreen(
 ) : LightScreen<Unit, TextReaderViewModel>(sealedActivity) {
 
     private val vibrator = sealedActivity.vibrator
+    private val isForegroundFlow = MutableStateFlow(true)
+
+    override fun willShow() {
+        super.willShow()
+        isForegroundFlow.value = true
+    }
+
+    override fun willHide() {
+        isForegroundFlow.value = false
+        super.willHide()
+    }
+
+    override fun onAppPause() {
+        isForegroundFlow.value = false
+        super.onAppPause()
+    }
 
     private val repository = ReaderRepository.getInstance(
         dbProvider = {
@@ -573,6 +589,7 @@ class TextReaderScreen(
     @Composable
     override fun Content() {
         val themeColors by LightThemeController.colors.collectAsState()
+        val isForeground by isForegroundFlow.collectAsState()
         val book by viewModel.book.collectAsState()
         val chapterIndex by viewModel.chapterIndex.collectAsState()
         val targetScrollPermille by viewModel.targetScrollPermille.collectAsState()
@@ -648,23 +665,24 @@ class TextReaderScreen(
         var currentPageIndex by remember(chapterIndex) { mutableIntStateOf(0) }
         val safePageIndex = if (pages.isEmpty()) 0 else currentPageIndex.coerceIn(0, pages.lastIndex)
 
-        // Compute current scroll position as 0..1000 permille (Scroll mode)
-        val scrollModePermille by remember(scrollState) {
-            derivedStateOf {
-                val max = scrollState.maxValue
-                if (max <= 0) 0 else ((scrollState.value.toFloat() / max.toFloat()) * 1000f).roundToInt().coerceIn(0, 1000)
-            }
+        // Read current scroll position lazily (never triggers top-level recomposition on scroll!)
+        fun readScrollModePermille(): Int {
+            val max = scrollState.maxValue
+            return if (max <= 0) 0 else ((scrollState.value.toFloat() / max.toFloat()) * 1000f).roundToInt().coerceIn(0, 1000)
         }
 
-        val activeScrollPermille = if (pageMode == ReaderPageMode.PAGED) {
+        fun readActiveScrollPermille(): Int = if (pageMode == ReaderPageMode.PAGED) {
             pages.getOrNull(safePageIndex)?.permilleStart ?: targetScrollPermille
         } else {
-            scrollModePermille
+            readScrollModePermille()
         }
 
         // Filled bookmark icon whenever current viewport/page is right at a saved bookmark in this chapter
-        val isNearSavedBookmark = remember(chapterBookmarks, activeScrollPermille) {
-            chapterBookmarks.any { abs(it.scrollPermille - activeScrollPermille) <= BOOKMARK_PROXIMITY_PERMILLE }
+        val isNearSavedBookmark by remember(scrollState, chapterBookmarks, pageMode, safePageIndex, pages, targetScrollPermille) {
+            derivedStateOf {
+                val permille = readActiveScrollPermille()
+                chapterBookmarks.any { abs(it.scrollPermille - permille) <= BOOKMARK_PROXIMITY_PERMILLE }
+            }
         }
 
         // Restore exact scroll target in SCROLL mode
@@ -695,7 +713,7 @@ class TextReaderScreen(
         // Report scroll updates in SCROLL mode
         LaunchedEffect(chapterIndex, pageMode, scrollState) {
             if (pageMode != ReaderPageMode.SCROLL) return@LaunchedEffect
-            snapshotFlow { scrollModePermille }
+            snapshotFlow { readScrollModePermille() }
                 .distinctUntilChanged()
                 .collect { permille ->
                     viewModel.onScrollChanged(permille)
@@ -721,7 +739,7 @@ class TextReaderScreen(
                 .maxByOrNull { it.value }
                 ?.key
                 ?: blockOffsets.entries.minByOrNull { abs(it.value - scrollY) }?.key
-                ?: ((scrollModePermille / 1000f) * chapter.blocks.lastIndex).roundToInt()
+                ?: ((readScrollModePermille() / 1000f) * chapter.blocks.lastIndex).roundToInt()
                     .coerceIn(0, chapter.blocks.lastIndex)
             return chapter.blocks.getOrNull(bestIdx)?.text.orEmpty()
         }
@@ -764,7 +782,6 @@ class TextReaderScreen(
 
         val haptics = LocalHapticFeedback.current
         val isOverlayOpen = heldWord != null || isLookingUp || lookupResult != null
-        val liveActivePermille by rememberUpdatedState(activeScrollPermille)
 
         LightTheme(colors = themeColors) {
             val activeComposing = composingNote
@@ -790,6 +807,7 @@ class TextReaderScreen(
                         null
                     },
                     editorKey = activeComposing.existingNote?.id ?: activeComposing.quotedExcerpt,
+                    isForeground = isForeground,
                 )
                 return@LightTheme
             }
@@ -854,7 +872,7 @@ class TextReaderScreen(
                             thickness = 1.dp,
                         )
                     } else if (!isFullScreen) {
-                        LightTopBar(
+                        BatteryTopBar(
                             leftButton = LightBarButton.LightIcon(
                                 icon = LightIcons.BACK,
                                 onClick = { goBack() },
@@ -867,11 +885,12 @@ class TextReaderScreen(
                                 contentDescription = if (isNearSavedBookmark) "Bookmarked here" else "Bookmark this spot",
                                 onClick = {
                                     viewModel.toggleBookmarkAt(
-                                        scrollPermille = activeScrollPermille,
+                                        scrollPermille = readActiveScrollPermille(),
                                         visibleSnippet = findVisibleSnippet(),
                                     )
                                 },
                             ),
+                            isForeground = isForeground,
                             modifier = Modifier.padding(bottom = 0.5f.gridUnitsAsDp()),
                         )
 
@@ -886,46 +905,14 @@ class TextReaderScreen(
                                 ),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            val progressText = if (totalChapters > 0) {
-                                when (progressMode) {
-                                    ReaderProgressMode.BOOK -> {
-                                        val bookPct = (
-                                            ((chapterIndex.toFloat() + (activeScrollPermille / 1000f)) / totalChapters.toFloat()) * 100f
-                                            ).roundToInt().coerceIn(0, 100)
-                                        if (totalChapters > 1) {
-                                            "Ch. ${chapterIndex + 1}/$totalChapters • $bookPct%"
-                                        } else {
-                                            "$bookPct% book"
-                                        }
-                                    }
-                                    ReaderProgressMode.CHAPTER -> {
-                                        val scrollPct = (activeScrollPermille / 10).coerceIn(0, 100)
-                                        if (totalChapters > 1) {
-                                            "Ch. ${chapterIndex + 1}/$totalChapters • $scrollPct% ch."
-                                        } else {
-                                            "$scrollPct% ch."
-                                        }
-                                    }
-                                    ReaderProgressMode.HIDDEN -> {
-                                        if (totalChapters > 1) {
-                                            "Ch. ${chapterIndex + 1}/$totalChapters"
-                                        } else {
-                                            "•••"
-                                        }
-                                    }
-                                }
-                            } else {
-                                book?.title.orEmpty()
-                            }
-                            LightText(
-                                text = progressText,
-                                variant = LightTextVariant.Detail,
-                                lighten = true,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .lightClickable { viewModel.cycleProgressMode() },
+                            ChapterProgressLabel(
+                                totalChapters = totalChapters,
+                                chapterIndex = chapterIndex,
+                                progressMode = progressMode,
+                                fallbackTitle = book?.title.orEmpty(),
+                                readPermille = { readActiveScrollPermille() },
+                                onCycleProgressMode = { viewModel.cycleProgressMode() },
+                                modifier = Modifier.weight(1f),
                             )
 
                             if (totalChapters > 1) {
@@ -975,7 +962,7 @@ class TextReaderScreen(
                                         color = LightThemeTokens.colors.content.copy(alpha = 0.55f),
                                         shape = RoundedCornerShape(4.dp),
                                     )
-                                    .lightClickable { viewModel.togglePageMode(activeScrollPermille) }
+                                    .lightClickable { viewModel.togglePageMode(readActiveScrollPermille()) }
                                     .padding(horizontal = 6.dp, vertical = 2.dp),
                             ) {
                                 LightText(
@@ -991,7 +978,7 @@ class TextReaderScreen(
                                 lighten = true,
                                 modifier = Modifier
                                     .padding(start = 8.dp)
-                                    .lightClickable { viewModel.cycleFontSize(activeScrollPermille) },
+                                    .lightClickable { viewModel.cycleFontSize(readActiveScrollPermille()) },
                             )
                         }
                     }
@@ -1005,7 +992,7 @@ class TextReaderScreen(
                                 if (isOverlayOpen || isSelectingNoteWords) return@pointerInput
                                 detectTapGestures(
                                     onDoubleTap = {
-                                        viewModel.toggleFullScreen(liveActivePermille)
+                                        viewModel.toggleFullScreen(readActiveScrollPermille())
                                     },
                                 )
                             },
@@ -1095,11 +1082,11 @@ class TextReaderScreen(
                                                                 paragraphIndex = slice.sourceIndex,
                                                                 fullParagraphText = fullBlockText,
                                                                 charIndexInParagraph = slice.charOffsetInBlock + offset,
-                                                                scrollPermille = liveActivePermille,
+                                                                scrollPermille = readActiveScrollPermille(),
                                                             )
                                                         },
                                                         onDoubleTap = {
-                                                            viewModel.toggleFullScreen(liveActivePermille)
+                                                            viewModel.toggleFullScreen(readActiveScrollPermille())
                                                         },
                                                         modifier = Modifier.weight(1f),
                                                     )
@@ -1131,11 +1118,11 @@ class TextReaderScreen(
                                                             paragraphIndex = slice.sourceIndex,
                                                             fullParagraphText = fullBlockText,
                                                             charIndexInParagraph = slice.charOffsetInBlock + offset,
-                                                            scrollPermille = liveActivePermille,
+                                                            scrollPermille = readActiveScrollPermille(),
                                                         )
                                                     },
                                                     onDoubleTap = {
-                                                        viewModel.toggleFullScreen(liveActivePermille)
+                                                        viewModel.toggleFullScreen(readActiveScrollPermille())
                                                     },
                                                     modifier = Modifier
                                                         .fillMaxWidth()
@@ -1214,11 +1201,11 @@ class TextReaderScreen(
                                                                 paragraphIndex = idx,
                                                                 fullParagraphText = block.text,
                                                                 charIndexInParagraph = offset,
-                                                                scrollPermille = liveActivePermille,
+                                                                scrollPermille = readActiveScrollPermille(),
                                                             )
                                                         },
                                                         onDoubleTap = {
-                                                            viewModel.toggleFullScreen(liveActivePermille)
+                                                            viewModel.toggleFullScreen(readActiveScrollPermille())
                                                         },
                                                         modifier = Modifier.weight(1f),
                                                     )
@@ -1250,11 +1237,11 @@ class TextReaderScreen(
                                                             paragraphIndex = idx,
                                                             fullParagraphText = block.text,
                                                             charIndexInParagraph = offset,
-                                                            scrollPermille = liveActivePermille,
+                                                            scrollPermille = readActiveScrollPermille(),
                                                         )
                                                     },
                                                     onDoubleTap = {
-                                                        viewModel.toggleFullScreen(liveActivePermille)
+                                                        viewModel.toggleFullScreen(readActiveScrollPermille())
                                                     },
                                                     modifier = trackOffsetModifier
                                                         .fillMaxWidth()
@@ -1377,6 +1364,62 @@ class TextReaderScreen(
             }
         }
     }
+}
+
+@Composable
+private fun ChapterProgressLabel(
+    totalChapters: Int,
+    chapterIndex: Int,
+    progressMode: ReaderProgressMode,
+    fallbackTitle: String,
+    readPermille: () -> Int,
+    onCycleProgressMode: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val progressText by remember(totalChapters, chapterIndex, progressMode, fallbackTitle) {
+        derivedStateOf {
+            if (totalChapters > 0) {
+                val permille = readPermille()
+                when (progressMode) {
+                    ReaderProgressMode.BOOK -> {
+                        val bookPct = (
+                            ((chapterIndex.toFloat() + (permille / 1000f)) / totalChapters.toFloat()) * 100f
+                            ).roundToInt().coerceIn(0, 100)
+                        if (totalChapters > 1) {
+                            "Ch. ${chapterIndex + 1}/$totalChapters • $bookPct%"
+                        } else {
+                            "$bookPct% book"
+                        }
+                    }
+                    ReaderProgressMode.CHAPTER -> {
+                        val scrollPct = (permille / 10).coerceIn(0, 100)
+                        if (totalChapters > 1) {
+                            "Ch. ${chapterIndex + 1}/$totalChapters • $scrollPct% ch."
+                        } else {
+                            "$scrollPct% ch."
+                        }
+                    }
+                    ReaderProgressMode.HIDDEN -> {
+                        if (totalChapters > 1) {
+                            "Ch. ${chapterIndex + 1}/$totalChapters"
+                        } else {
+                            "•••"
+                        }
+                    }
+                }
+            } else {
+                fallbackTitle
+            }
+        }
+    }
+    LightText(
+        text = progressText,
+        variant = LightTextVariant.Detail,
+        lighten = true,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+        modifier = modifier.lightClickable(onClick = onCycleProgressMode),
+    )
 }
 
 @Composable

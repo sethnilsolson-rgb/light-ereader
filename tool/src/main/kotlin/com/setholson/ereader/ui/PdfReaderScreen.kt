@@ -314,7 +314,7 @@ class PdfReaderViewModel(
         liveScrollPermille = clamped
         scrollSaveJob?.cancel()
         scrollSaveJob = viewModelScope.launch {
-            delay(500L)
+            delay(900L)
             repository.updateScrollProgress(bookId, clamped)
         }
     }
@@ -851,6 +851,22 @@ class PdfReaderScreen(
 ) : LightScreen<Unit, PdfReaderViewModel>(sealedActivity) {
 
     private val vibrator = sealedActivity.vibrator
+    private val isForegroundFlow = MutableStateFlow(true)
+
+    override fun willShow() {
+        super.willShow()
+        isForegroundFlow.value = true
+    }
+
+    override fun willHide() {
+        isForegroundFlow.value = false
+        super.willHide()
+    }
+
+    override fun onAppPause() {
+        isForegroundFlow.value = false
+        super.onAppPause()
+    }
 
     private val repository = ReaderRepository.getInstance(
         dbProvider = {
@@ -883,6 +899,7 @@ class PdfReaderScreen(
     @Composable
     override fun Content() {
         val themeColors by LightThemeController.colors.collectAsState()
+        val isForeground by isForegroundFlow.collectAsState()
         val pageIndex by viewModel.pageIndex.collectAsState()
         val pageCount by viewModel.pageCount.collectAsState()
         val targetScrollPermille by viewModel.targetScrollPermille.collectAsState()
@@ -978,22 +995,23 @@ class PdfReaderScreen(
         var currentSubPageIndex by remember(pageIndex) { mutableIntStateOf(0) }
         val safeSubPageIndex = if (pagedPages.isEmpty()) 0 else currentSubPageIndex.coerceIn(0, pagedPages.lastIndex)
 
-        val scrollModePermille by remember(textScrollState) {
-            derivedStateOf {
-                val max = textScrollState.maxValue
-                if (max <= 0) 0 else ((textScrollState.value.toFloat() / max.toFloat()) * 1000f).roundToInt().coerceIn(0, 1000)
-            }
+        // Read scroll permille lazily so scrolling long PDF text pages never recomposes the full screen
+        fun readScrollModePermille(): Int {
+            val max = textScrollState.maxValue
+            return if (max <= 0) 0 else ((textScrollState.value.toFloat() / max.toFloat()) * 1000f).roundToInt().coerceIn(0, 1000)
         }
 
-        val activeTextPermille = when {
+        fun readActiveTextPermille(): Int = when {
             !isTextMode -> 0
             pageMode == ReaderPageMode.PAGED -> pagedPages.getOrNull(safeSubPageIndex)?.permilleStart ?: targetScrollPermille
-            else -> scrollModePermille
+            else -> readScrollModePermille()
         }
 
-        val isNearSavedBookmark = remember(pageBookmarks, isTextMode, activeTextPermille) {
-            val target = if (isTextMode) activeTextPermille else 0
-            pageBookmarks.any { abs(it.scrollPermille - target) <= BOOKMARK_PROXIMITY_PERMILLE }
+        val isNearSavedBookmark by remember(textScrollState, pageBookmarks, isTextMode, pageMode, safeSubPageIndex, pagedPages, targetScrollPermille) {
+            derivedStateOf {
+                val target = if (isTextMode) readActiveTextPermille() else 0
+                pageBookmarks.any { abs(it.scrollPermille - target) <= BOOKMARK_PROXIMITY_PERMILLE }
+            }
         }
 
         // Restore exact scroll target in PDF Text SCROLL mode
@@ -1024,7 +1042,7 @@ class PdfReaderScreen(
         // Persist scroll position in PDF Text SCROLL mode
         LaunchedEffect(pageIndex, isTextMode, pageMode, textScrollState) {
             if (!isTextMode || pageMode != ReaderPageMode.SCROLL) return@LaunchedEffect
-            snapshotFlow { scrollModePermille }
+            snapshotFlow { readScrollModePermille() }
                 .distinctUntilChanged()
                 .collect { permille ->
                     viewModel.onTextScrollChanged(permille)
@@ -1051,7 +1069,7 @@ class PdfReaderScreen(
                 .maxByOrNull { it.value }
                 ?.key
                 ?: blockOffsets.entries.minByOrNull { abs(it.value - scrollY) }?.key
-                ?: ((scrollModePermille / 1000f) * blocks.lastIndex).roundToInt()
+                ?: ((readScrollModePermille() / 1000f) * blocks.lastIndex).roundToInt()
                     .coerceIn(0, blocks.lastIndex)
             return blocks.getOrNull(bestIdx)?.text.orEmpty()
         }
@@ -1179,7 +1197,6 @@ class PdfReaderScreen(
         val liveFitWidthScale = rememberUpdatedState(fitWidthScale)
         val livePageIndex = rememberUpdatedState(pageIndex)
         val livePageCount = rememberUpdatedState(pageCount)
-        val liveActiveTextPermille by rememberUpdatedState(activeTextPermille)
 
         val contentColor = LightThemeTokens.colors.content
         val bookmarkPainter = rememberVectorPainter(
@@ -1224,6 +1241,7 @@ class PdfReaderScreen(
                         null
                     },
                     editorKey = activeComposing.existingNote?.id ?: activeComposing.quotedExcerpt,
+                    isForeground = isForeground,
                 )
                 return@LightTheme
             }
@@ -1277,7 +1295,7 @@ class PdfReaderScreen(
                             thickness = 1.dp,
                         )
                     } else if (!hideChrome) {
-                        LightTopBar(
+                        BatteryTopBar(
                             leftButton = LightBarButton.LightIcon(
                                 icon = LightIcons.BACK,
                                 onClick = { goBack() },
@@ -1288,11 +1306,12 @@ class PdfReaderScreen(
                                 contentDescription = if (isNearSavedBookmark) "Bookmarked here" else "Bookmark this spot",
                                 onClick = {
                                     viewModel.toggleBookmarkAt(
-                                        scrollPermille = activeTextPermille,
+                                        scrollPermille = readActiveTextPermille(),
                                         visibleSnippet = findVisibleTextSnippet(),
                                     )
                                 },
                             ),
+                            isForeground = isForeground,
                             modifier = Modifier.padding(bottom = 0.25f.gridUnitsAsDp()),
                         )
 
@@ -1332,7 +1351,7 @@ class PdfReaderScreen(
                                 PdfControlChip(
                                     label = pageMode.chipLabel,
                                     highlighted = pageMode == ReaderPageMode.PAGED,
-                                    onClick = { viewModel.togglePageMode(activeTextPermille) },
+                                    onClick = { viewModel.togglePageMode(readActiveTextPermille()) },
                                 )
                                 Spacer(modifier = Modifier.width(4.dp))
                                 PdfControlChip(
@@ -1347,7 +1366,7 @@ class PdfReaderScreen(
                                 PdfControlChip(
                                     label = fontSize.displayLabel,
                                     highlighted = false,
-                                    onClick = { viewModel.cycleFontSize(activeTextPermille) },
+                                    onClick = { viewModel.cycleFontSize(readActiveTextPermille()) },
                                 )
                             } else {
                                 PdfControlChip(
@@ -1570,7 +1589,7 @@ class PdfReaderScreen(
                                         if (isOverlayOpen || isSelectingNoteWords) return@pointerInput
                                         detectTapGestures(
                                             onDoubleTap = {
-                                                viewModel.toggleFullScreen(liveActiveTextPermille)
+                                                viewModel.toggleFullScreen(readActiveTextPermille())
                                             },
                                         )
                                     },
@@ -1658,11 +1677,11 @@ class PdfReaderScreen(
                                                             paragraphIndex = slice.sourceIndex,
                                                             fullParagraphText = fullBlockText,
                                                             charIndexInParagraph = slice.charOffsetInBlock + offset,
-                                                            scrollPermille = liveActiveTextPermille,
+                                                            scrollPermille = readActiveTextPermille(),
                                                         )
                                                     },
                                                     onDoubleTap = {
-                                                        viewModel.toggleFullScreen(liveActiveTextPermille)
+                                                        viewModel.toggleFullScreen(readActiveTextPermille())
                                                     },
                                                     modifier = Modifier
                                                         .fillMaxWidth()
@@ -1725,11 +1744,11 @@ class PdfReaderScreen(
                                                             paragraphIndex = idx,
                                                             fullParagraphText = block.text,
                                                             charIndexInParagraph = offset,
-                                                            scrollPermille = liveActiveTextPermille,
+                                                            scrollPermille = readActiveTextPermille(),
                                                         )
                                                     },
                                                     onDoubleTap = {
-                                                        viewModel.toggleFullScreen(liveActiveTextPermille)
+                                                        viewModel.toggleFullScreen(readActiveTextPermille())
                                                     },
                                                     modifier = trackOffsetModifier
                                                         .fillMaxWidth()
@@ -1961,41 +1980,17 @@ class PdfReaderScreen(
                                 Spacer(modifier = Modifier.weight(1f))
                             }
 
-                            if (isTextPaged) {
-                                val pct = if (pageCount > 0) {
-                                    (((pageIndex.toFloat() + (activeTextPermille / 1000f)) / pageCount) * 100f)
-                                        .roundToInt().coerceIn(0, 100)
-                                } else {
-                                    0
-                                }
-                                val centerText = if (progressMode == ReaderProgressMode.HIDDEN) {
-                                    "${safeSubPageIndex + 1}/${pagedPages.size}"
-                                } else {
-                                    "${safeSubPageIndex + 1}/${pagedPages.size} • $pct%"
-                                }
-                                LightText(
-                                    text = centerText,
-                                    variant = LightTextVariant.Detail,
-                                    lighten = true,
-                                    modifier = Modifier
-                                        .lightClickable { viewModel.toggleProgressVisibility() }
-                                        .padding(horizontal = 10.dp, vertical = 2.dp),
-                                )
-                            } else if (pageCount > 0) {
-                                val pct = if (isTextMode) {
-                                    (((pageIndex.toFloat() + (activeTextPermille / 1000f)) / pageCount) * 100f)
-                                        .roundToInt().coerceIn(0, 100)
-                                } else {
-                                    (((pageIndex + 1).toFloat() / pageCount) * 100f).toInt().coerceIn(1, 100)
-                                }
-                                val centerText = if (progressMode == ReaderProgressMode.HIDDEN) "•••" else "$pct%"
-                                LightText(
-                                    text = centerText,
-                                    variant = LightTextVariant.Detail,
-                                    lighten = true,
-                                    modifier = Modifier
-                                        .lightClickable { viewModel.toggleProgressVisibility() }
-                                        .padding(horizontal = 10.dp, vertical = 2.dp),
+                            if (isTextPaged || pageCount > 0) {
+                                PdfFooterProgressText(
+                                    isTextPaged = isTextPaged,
+                                    isTextMode = isTextMode,
+                                    pageIndex = pageIndex,
+                                    pageCount = pageCount,
+                                    safeSubPageIndex = safeSubPageIndex,
+                                    pagedPagesSize = pagedPages.size,
+                                    progressMode = progressMode,
+                                    readPermille = { readActiveTextPermille() },
+                                    onToggleVisibility = { viewModel.toggleProgressVisibility() },
                                 )
                             }
 
@@ -2046,6 +2041,61 @@ class PdfReaderScreen(
             }
         }
     }
+}
+
+@Composable
+private fun PdfFooterProgressText(
+    isTextPaged: Boolean,
+    isTextMode: Boolean,
+    pageIndex: Int,
+    pageCount: Int,
+    safeSubPageIndex: Int,
+    pagedPagesSize: Int,
+    progressMode: ReaderProgressMode,
+    readPermille: () -> Int,
+    onToggleVisibility: () -> Unit,
+) {
+    val centerText by remember(
+        isTextPaged,
+        isTextMode,
+        pageIndex,
+        pageCount,
+        safeSubPageIndex,
+        pagedPagesSize,
+        progressMode,
+    ) {
+        derivedStateOf {
+            if (isTextPaged) {
+                val pct = if (pageCount > 0) {
+                    (((pageIndex.toFloat() + (readPermille() / 1000f)) / pageCount) * 100f)
+                        .roundToInt().coerceIn(0, 100)
+                } else {
+                    0
+                }
+                if (progressMode == ReaderProgressMode.HIDDEN) {
+                    "${safeSubPageIndex + 1}/$pagedPagesSize"
+                } else {
+                    "${safeSubPageIndex + 1}/$pagedPagesSize • $pct%"
+                }
+            } else {
+                val pct = if (isTextMode) {
+                    (((pageIndex.toFloat() + (readPermille() / 1000f)) / pageCount) * 100f)
+                        .roundToInt().coerceIn(0, 100)
+                } else {
+                    (((pageIndex + 1).toFloat() / pageCount) * 100f).toInt().coerceIn(1, 100)
+                }
+                if (progressMode == ReaderProgressMode.HIDDEN) "•••" else "$pct%"
+            }
+        }
+    }
+    LightText(
+        text = centerText,
+        variant = LightTextVariant.Detail,
+        lighten = true,
+        modifier = Modifier
+            .lightClickable(onClick = onToggleVisibility)
+            .padding(horizontal = 10.dp, vertical = 2.dp),
+    )
 }
 
 @Composable

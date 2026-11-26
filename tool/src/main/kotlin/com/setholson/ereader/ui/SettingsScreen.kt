@@ -228,7 +228,7 @@ class SettingsScreen(
                     .swipeToBack { goBack() },
             ) {
                 Column(modifier = Modifier.fillMaxSize()) {
-                    LightTopBar(
+                    BatteryTopBar(
                         leftButton = LightBarButton.LightIcon(
                             icon = LightIcons.BACK,
                             onClick = { goBack() },

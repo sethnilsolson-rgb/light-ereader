@@ -283,7 +283,7 @@ class BookmarksScreen(
                         is BookmarksHubPage.NotesChapterDetail -> cur.chapterTitle
                     }
 
-                    LightTopBar(
+                    BatteryTopBar(
                         leftButton = LightBarButton.LightIcon(
                             icon = LightIcons.BACK,
                             onClick = { navigateUp() },
