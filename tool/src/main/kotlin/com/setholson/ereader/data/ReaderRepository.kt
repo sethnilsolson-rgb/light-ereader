@@ -2,6 +2,7 @@ package com.setholson.ereader.data
 
 import android.graphics.Bitmap
 import com.setholson.ereader.db.BookBookmarkEntity
+import com.setholson.ereader.db.BookNoteEntity
 import com.setholson.ereader.db.BookProgressEntity
 import com.setholson.ereader.db.ReaderDatabase
 import com.setholson.ereader.db.ReaderSettingEntity
@@ -47,6 +48,8 @@ class ReaderRepository(
 
     val bookmarks: Flow<List<BookBookmarkEntity>> = database.bookmarkDao().getAllBookmarks()
     val bookmarkCount: Flow<Int> = database.bookmarkDao().getBookmarkCount()
+    val allNotes: Flow<List<BookNoteEntity>> = database.noteDao().getAllNotes()
+    val noteCount: Flow<Int> = database.noteDao().getNoteCount()
     val allProgress: Flow<List<BookProgressEntity>> = database.progressDao().getAllProgress()
     val mostRecentProgress: Flow<BookProgressEntity?> = database.progressDao().getMostRecentProgress()
 
@@ -582,12 +585,24 @@ class ReaderRepository(
         database.bookmarkDao().deleteBookmark(bookmark)
     }
 
+    fun getNotesForPosition(bookId: String, positionIndex: Int): Flow<List<BookNoteEntity>> =
+        database.noteDao().getNotesForPosition(bookId, positionIndex)
+
+    suspend fun saveNote(note: BookNoteEntity): Long = withContext(Dispatchers.IO) {
+        database.noteDao().insertNote(note)
+    }
+
+    suspend fun deleteNote(note: BookNoteEntity) = withContext(Dispatchers.IO) {
+        database.noteDao().deleteNote(note)
+    }
+
     suspend fun deleteBook(bookId: String): Boolean = withContext(Dispatchers.IO) {
         if (bookId == TextBookParser.WELCOME_GUIDE_ID) return@withContext false
         val file = resolveBookFile(bookId)
         val deleted = file?.delete() ?: false
         database.progressDao().deleteProgress(bookId)
         database.bookmarkDao().deleteAllForBook(bookId)
+        database.noteDao().deleteAllForBook(bookId)
         metadataCache.keys.filter { it.startsWith("$bookId|") }.forEach { metadataCache.remove(it) }
         parsedBookCache.keys.filter { it.startsWith("$bookId|") }.forEach { parsedBookCache.remove(it) }
         clearPdfTextCacheFilesFor(bookId)

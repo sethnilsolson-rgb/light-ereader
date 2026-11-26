@@ -58,3 +58,26 @@ data class DictCountRow(
     val dictId: String,
     val entryCount: Int,
 )
+
+@Entity(
+    tableName = "book_notes",
+    indices = [
+        Index(value = ["bookId", "positionIndex"]),
+        Index(value = ["updatedAt"]),
+    ],
+)
+data class BookNoteEntity(
+    @PrimaryKey(autoGenerate = true)
+    val id: Long = 0,
+    val bookId: String,
+    val bookTitle: String,
+    val format: String,
+    val positionIndex: Int,
+    val chapterTitle: String,
+    val anchorsEncoded: String,
+    val quotedText: String,
+    val noteText: String,
+    val scrollPermille: Int = 0,
+    val createdAt: Long = System.currentTimeMillis(),
+    val updatedAt: Long = System.currentTimeMillis(),
+)

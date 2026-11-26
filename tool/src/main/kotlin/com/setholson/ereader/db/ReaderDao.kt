@@ -96,3 +96,24 @@ interface ReaderSettingDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun putSetting(setting: ReaderSettingEntity)
 }
+
+@Dao
+interface BookNoteDao {
+    @Query("SELECT * FROM book_notes ORDER BY updatedAt DESC")
+    fun getAllNotes(): Flow<List<BookNoteEntity>>
+
+    @Query("SELECT COUNT(*) FROM book_notes")
+    fun getNoteCount(): Flow<Int>
+
+    @Query("SELECT * FROM book_notes WHERE bookId = :bookId AND positionIndex = :positionIndex ORDER BY updatedAt DESC")
+    fun getNotesForPosition(bookId: String, positionIndex: Int): Flow<List<BookNoteEntity>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertNote(note: BookNoteEntity): Long
+
+    @Query("DELETE FROM book_notes WHERE bookId = :bookId")
+    suspend fun deleteAllForBook(bookId: String)
+
+    @Delete
+    suspend fun deleteNote(note: BookNoteEntity)
+}

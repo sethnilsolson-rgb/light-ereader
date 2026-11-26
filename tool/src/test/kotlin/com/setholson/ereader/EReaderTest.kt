@@ -5,10 +5,13 @@ import com.setholson.ereader.data.FreeBooksCatalog
 import com.setholson.ereader.data.OfflineDictionaryService
 import com.setholson.ereader.data.TextBookParser
 import com.setholson.ereader.data.WifiBookServer
+import com.setholson.ereader.db.BookNoteEntity
 import com.setholson.ereader.model.BookFormat
 import com.setholson.ereader.model.DictionaryPack
 import com.setholson.ereader.model.ReaderFontSize
 import com.setholson.ereader.model.ReaderPageMode
+import com.setholson.ereader.model.WordAnchor
+import com.setholson.ereader.model.WordNoteUtils
 import com.setholson.ereader.ui.EReaderPage
 import com.setholson.ereader.ui.EReaderPageSlice
 import com.setholson.ereader.ui.EReaderPaginator
@@ -369,6 +372,86 @@ class EReaderTest {
         assertEquals(2, EReaderPaginator.pageIndexForPermille(pages, 720))
         assertEquals(2, EReaderPaginator.pageIndexForPermille(pages, 1000))
         assertEquals(0, EReaderPaginator.pageIndexForPermille(emptyList(), 420))
+    }
+
+    @Test
+    fun wordNoteExtractToggleExcerptAndHierarchyOrdering() {
+        val text = "Call me Ishmael. Some years ago—never mind how long precisely."
+        val callAnchor = WordNoteUtils.extractWordAnchor(text, 0, 1)!!
+        val meAnchor = WordNoteUtils.extractWordAnchor(text, 0, 5)!!
+        val ishmaelAnchor = WordNoteUtils.extractWordAnchor(text, 0, 10)!!
+        assertEquals("Ishmael", WordNoteUtils.extractWordText(text, ishmaelAnchor))
+
+        var selected = listOf(callAnchor)
+        selected = WordNoteUtils.toggleWordAnchor(selected, ishmaelAnchor)
+        selected = WordNoteUtils.toggleWordAnchor(selected, meAnchor)
+        assertEquals("Call me Ishmael", WordNoteUtils.buildQuotedExcerpt(selected, { if (it == 0) text else null }))
+
+        // Tapping an underlined word removes its underline
+        selected = WordNoteUtils.toggleWordAnchor(selected, meAnchor)
+        assertEquals("Call \u2026 Ishmael", WordNoteUtils.buildQuotedExcerpt(selected, { if (it == 0) text else null }))
+
+        // Encode/decode round-trip
+        assertEquals(selected, WordNoteUtils.decodeAnchors(WordNoteUtils.encodeAnchors(selected)))
+
+        // Book -> Chapter -> Notes hierarchy ordered newest first at every level
+        val notes = listOf(
+            BookNoteEntity(
+                id = 10,
+                bookId = "moby.epub",
+                bookTitle = "Moby-Dick",
+                format = BookFormat.EPUB.name,
+                positionIndex = 0,
+                chapterTitle = "Chapter 1: Loomings",
+                anchorsEncoded = "0:0:4",
+                quotedText = "Call",
+                noteText = "Opening line",
+                updatedAt = 1000L,
+            ),
+            BookNoteEntity(
+                id = 11,
+                bookId = "walden.pdf",
+                bookTitle = "Walden",
+                format = BookFormat.PDF.name,
+                positionIndex = 4,
+                chapterTitle = "Page 5",
+                anchorsEncoded = "2:0:6",
+                quotedText = "simple",
+                noteText = "Simplicity",
+                updatedAt = 2500L,
+            ),
+            BookNoteEntity(
+                id = 12,
+                bookId = "moby.epub",
+                bookTitle = "Moby-Dick",
+                format = BookFormat.EPUB.name,
+                positionIndex = 0,
+                chapterTitle = "Chapter 1: Loomings",
+                anchorsEncoded = "0:8:15",
+                quotedText = "Ishmael",
+                noteText = "Narrator name",
+                updatedAt = 4000L,
+            ),
+        )
+
+        val grouped = WordNoteUtils.groupNotesByBookAndChapter(notes)
+        assertEquals(2, grouped.size)
+        assertEquals("Moby-Dick", grouped[0].bookTitle)
+        assertEquals(2, grouped[0].totalNoteCount)
+        assertEquals(listOf(12L, 10L), grouped[0].chapters[0].notes.map { it.id })
+        assertEquals("Walden", grouped[1].bookTitle)
+
+        // Slice offset underlining
+        val sliceAnnotated = WordNoteUtils.buildUnderlinedText(
+            text = "Ishmael. Some years",
+            paragraphIndex = 0,
+            sliceOffsetInParagraph = 8,
+            savedAnchors = listOf(WordAnchor(0, 8, 15)),
+            selectedAnchors = emptyList(),
+        )
+        assertEquals(1, sliceAnnotated.spanStyles.size)
+        assertEquals(0, sliceAnnotated.spanStyles[0].start)
+        assertEquals(7, sliceAnnotated.spanStyles[0].end)
     }
 
     private fun writeZip(target: File, entries: Map<String, String>) {

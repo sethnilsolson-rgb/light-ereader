@@ -241,7 +241,10 @@ class AddBooksScreen(
                 ReaderDatabase::class.java,
                 ReaderRepository.DATABASE_NAME,
             ) {
-                addMigrations(ReaderDatabase.MIGRATION_2_3)
+                addMigrations(
+                    ReaderDatabase.MIGRATION_2_3,
+                    ReaderDatabase.MIGRATION_3_4,
+                )
                 fallbackToDestructiveMigration(true)
             }
         },

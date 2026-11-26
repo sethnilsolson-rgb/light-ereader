@@ -15,6 +15,7 @@ data class EReaderPageSlice(
     val isHeading: Boolean,
     val isQuote: Boolean,
     val isContinuation: Boolean,
+    val charOffsetInBlock: Int = 0,
 )
 
 data class EReaderPage(
@@ -165,6 +166,7 @@ object EReaderPaginator {
                             isHeading = block.isHeading,
                             isQuote = block.isQuote,
                             isContinuation = !isFirstSlice,
+                            charOffsetInBlock = charStart,
                         )
                     )
                     currentY += topPad + sliceHeight + if (isLastSlice) bottomPadFull else 0

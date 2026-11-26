@@ -23,6 +23,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.input.TextFieldState
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -54,7 +56,9 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewModelScope
@@ -64,18 +68,22 @@ import com.setholson.ereader.data.PdfTextExtractionResult
 import com.setholson.ereader.data.ReaderRepository
 import com.setholson.ereader.data.RenderedPdfPage
 import com.setholson.ereader.db.BookBookmarkEntity
+import com.setholson.ereader.db.BookNoteEntity
 import com.setholson.ereader.db.ReaderDatabase
 import com.setholson.ereader.model.BookFormat
 import com.setholson.ereader.model.ReaderFontSize
 import com.setholson.ereader.model.ReaderPageMode
 import com.setholson.ereader.model.ReaderProgressMode
 import com.setholson.ereader.model.TextBlock
+import com.setholson.ereader.model.WordAnchor
 import com.setholson.ereader.model.WordLookupResult
+import com.setholson.ereader.model.WordNoteUtils
 import com.thelightphone.sdk.LightScreen
 import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.SimpleLightScreen
 import com.thelightphone.sdk.buildDatabase
+import com.thelightphone.sdk.rememberKeyboardOptions
 import com.thelightphone.sdk.ui.LightBarButton
 import com.thelightphone.sdk.ui.LightIcons
 import com.thelightphone.sdk.ui.LightScrollView
@@ -134,6 +142,7 @@ class PdfReaderViewModel(
     private val bookTitle: String,
     private val explicitStartPage: Int?,
     private val explicitStartScrollPermille: Int?,
+    private val preferTextMode: Boolean,
     private val repository: ReaderRepository,
 ) : LightViewModel<Unit>() {
 
@@ -201,6 +210,23 @@ class PdfReaderViewModel(
     private val _isFullScreen = MutableStateFlow(false)
     val isFullScreen: StateFlow<Boolean> = _isFullScreen.asStateFlow()
 
+    private val _pageNotes = MutableStateFlow<List<BookNoteEntity>>(emptyList())
+    val pageNotes: StateFlow<List<BookNoteEntity>> = _pageNotes.asStateFlow()
+
+    private val _heldWord = MutableStateFlow<HeldWordContext?>(null)
+    val heldWord: StateFlow<HeldWordContext?> = _heldWord.asStateFlow()
+
+    private val _isSelectingNoteWords = MutableStateFlow(false)
+    val isSelectingNoteWords: StateFlow<Boolean> = _isSelectingNoteWords.asStateFlow()
+
+    private val _selectedWordAnchors = MutableStateFlow<List<WordAnchor>>(emptyList())
+    val selectedWordAnchors: StateFlow<List<WordAnchor>> = _selectedWordAnchors.asStateFlow()
+
+    private var noteSelectionScrollPermille: Int = 0
+
+    private val _composingNote = MutableStateFlow<ComposingNoteState?>(null)
+    val composingNote: StateFlow<ComposingNoteState?> = _composingNote.asStateFlow()
+
     private val _lookupEnabled = MutableStateFlow(false)
     val lookupEnabled: StateFlow<Boolean> = _lookupEnabled.asStateFlow()
 
@@ -218,6 +244,7 @@ class PdfReaderViewModel(
     private var renderJob: Job? = null
     private var tileJob: Job? = null
     private var bookmarkJob: Job? = null
+    private var notesJob: Job? = null
     private var extractionJob: Job? = null
     private var extractionCancelled = AtomicBoolean(false)
     private var lookupJob: Job? = null
@@ -248,7 +275,8 @@ class PdfReaderViewModel(
 
                 val savedMode = repository.getPdfExtractionModeSync(bookId)
                 _extractionMode.value = savedMode
-                val wantTextMode = repository.getPdfTextModeSync(bookId) ||
+                val wantTextMode = preferTextMode ||
+                    repository.getPdfTextModeSync(bookId) ||
                     (explicitStartScrollPermille != null && explicitStartScrollPermille > 0)
                 if (wantTextMode) {
                     val cached = repository.getCachedPdfTextSync(bookId, savedMode)
@@ -309,6 +337,12 @@ class PdfReaderViewModel(
                 _pageBookmarks.value = saved
             }
         }
+        notesJob?.cancel()
+        notesJob = viewModelScope.launch {
+            repository.getNotesForPosition(bookId, safeIndex).collect { saved ->
+                _pageNotes.value = saved
+            }
+        }
     }
 
     private fun openTextPage(
@@ -346,6 +380,7 @@ class PdfReaderViewModel(
         _scrollRequestToken.value = _scrollRequestToken.value + 1L
         _errorText.value = null
         dismissLookup()
+        cancelNoteWordSelection()
         observeBookmarksAndSaveProgress(safeIndex, total, resolvedPermille)
     }
 
@@ -664,15 +699,37 @@ class PdfReaderViewModel(
         }
     }
 
-    fun lookupWordAt(text: String, charIndex: Int) {
-        if (!_lookupEnabled.value) return
+    fun onWordLongPressed(
+        paragraphIndex: Int,
+        fullParagraphText: String,
+        charIndexInParagraph: Int,
+        scrollPermille: Int,
+    ) {
+        val anchor = WordNoteUtils.extractWordAnchor(fullParagraphText, paragraphIndex, charIndexInParagraph)
+            ?: return
+        val wordText = WordNoteUtils.extractWordText(fullParagraphText, anchor)
+        if (wordText.isBlank()) return
+
+        val existing = WordNoteUtils.findNotesForAnchor(_pageNotes.value, anchor)
+        _heldWord.value = HeldWordContext(
+            anchor = anchor,
+            wordText = wordText,
+            scrollPermille = scrollPermille.coerceIn(0, 1000),
+            existingNotes = existing,
+        )
+
         lookupJob?.cancel()
-        lookupJob = viewModelScope.launch {
-            _isLookingUp.value = true
-            _lookupResult.value = null
-            val res = repository.lookupWord(text, charIndex)
+        if (_lookupEnabled.value) {
+            lookupJob = viewModelScope.launch {
+                _isLookingUp.value = true
+                _lookupResult.value = null
+                val res = repository.lookupWord(fullParagraphText, charIndexInParagraph)
+                _isLookingUp.value = false
+                _lookupResult.value = res
+            }
+        } else {
             _isLookingUp.value = false
-            _lookupResult.value = res
+            _lookupResult.value = null
         }
     }
 
@@ -680,6 +737,107 @@ class PdfReaderViewModel(
         lookupJob?.cancel()
         _isLookingUp.value = false
         _lookupResult.value = null
+        _heldWord.value = null
+    }
+
+    fun startNoteWordSelection() {
+        val held = _heldWord.value ?: return
+        dismissLookup()
+        noteSelectionScrollPermille = held.scrollPermille
+        _selectedWordAnchors.value = listOf(held.anchor)
+        _isSelectingNoteWords.value = true
+    }
+
+    fun toggleNoteWordAt(paragraphIndex: Int, fullParagraphText: String, charIndexInParagraph: Int): Boolean {
+        val anchor = WordNoteUtils.extractWordAnchor(fullParagraphText, paragraphIndex, charIndexInParagraph)
+            ?: return false
+        _selectedWordAnchors.value = WordNoteUtils.toggleWordAnchor(_selectedWordAnchors.value, anchor)
+        return true
+    }
+
+    fun cancelNoteWordSelection() {
+        _isSelectingNoteWords.value = false
+        _selectedWordAnchors.value = emptyList()
+    }
+
+    fun finishNoteWordSelection() {
+        val anchors = _selectedWordAnchors.value
+        val textPage = _extractedBook.value?.pages?.getOrNull(_pageIndex.value) ?: return
+        if (anchors.isEmpty()) return
+        val quoted = WordNoteUtils.buildQuotedExcerpt(
+            anchors = anchors,
+            paragraphLookup = { idx -> textPage.blocks.getOrNull(idx)?.text },
+        )
+        _isSelectingNoteWords.value = false
+        _selectedWordAnchors.value = emptyList()
+        _composingNote.value = ComposingNoteState(
+            existingNote = null,
+            anchors = anchors,
+            quotedExcerpt = quoted,
+            scrollPermille = noteSelectionScrollPermille,
+        )
+    }
+
+    fun openExistingNoteEditor(note: BookNoteEntity) {
+        dismissLookup()
+        _composingNote.value = ComposingNoteState(
+            existingNote = note,
+            anchors = WordNoteUtils.decodeAnchors(note.anchorsEncoded),
+            quotedExcerpt = note.quotedText,
+            scrollPermille = note.scrollPermille,
+        )
+    }
+
+    fun saveComposingNote(rawText: String) {
+        val composing = _composingNote.value ?: return
+        val idx = _pageIndex.value
+        val trimmed = rawText.trim()
+        val now = System.currentTimeMillis()
+        _composingNote.value = null
+
+        viewModelScope.launch {
+            val existing = composing.existingNote
+            if (trimmed.isEmpty()) {
+                if (existing != null) repository.deleteNote(existing)
+                return@launch
+            }
+            if (existing != null) {
+                repository.saveNote(
+                    existing.copy(
+                        noteText = trimmed,
+                        updatedAt = now,
+                    )
+                )
+            } else {
+                repository.saveNote(
+                    BookNoteEntity(
+                        bookId = bookId,
+                        bookTitle = bookTitle,
+                        format = BookFormat.PDF.name,
+                        positionIndex = idx,
+                        chapterTitle = "Page ${idx + 1}",
+                        anchorsEncoded = WordNoteUtils.encodeAnchors(composing.anchors),
+                        quotedText = composing.quotedExcerpt,
+                        noteText = trimmed,
+                        scrollPermille = composing.scrollPermille.coerceIn(0, 1000),
+                        createdAt = now,
+                        updatedAt = now,
+                    )
+                )
+            }
+        }
+    }
+
+    fun deleteComposingNote() {
+        val existing = _composingNote.value?.existingNote
+        _composingNote.value = null
+        if (existing != null) {
+            viewModelScope.launch { repository.deleteNote(existing) }
+        }
+    }
+
+    fun dismissNoteComposer() {
+        _composingNote.value = null
     }
 }
 
@@ -689,7 +847,10 @@ class PdfReaderScreen(
     private val bookTitle: String,
     private val initialPage: Int? = null,
     private val initialScrollPermille: Int? = null,
+    private val preferTextMode: Boolean = false,
 ) : LightScreen<Unit, PdfReaderViewModel>(sealedActivity) {
+
+    private val vibrator = sealedActivity.vibrator
 
     private val repository = ReaderRepository.getInstance(
         dbProvider = {
@@ -697,7 +858,10 @@ class PdfReaderScreen(
                 ReaderDatabase::class.java,
                 ReaderRepository.DATABASE_NAME,
             ) {
-                addMigrations(ReaderDatabase.MIGRATION_2_3)
+                addMigrations(
+                    ReaderDatabase.MIGRATION_2_3,
+                    ReaderDatabase.MIGRATION_3_4,
+                )
                 fallbackToDestructiveMigration(true)
             }
         },
@@ -712,6 +876,7 @@ class PdfReaderScreen(
         bookTitle = bookTitle,
         explicitStartPage = initialPage,
         explicitStartScrollPermille = initialScrollPermille,
+        preferTextMode = preferTextMode,
         repository = repository,
     )
 
@@ -727,6 +892,11 @@ class PdfReaderScreen(
         val isLoading by viewModel.isLoading.collectAsState()
         val errorText by viewModel.errorText.collectAsState()
         val pageBookmarks by viewModel.pageBookmarks.collectAsState()
+        val pageNotes by viewModel.pageNotes.collectAsState()
+        val heldWord by viewModel.heldWord.collectAsState()
+        val isSelectingNoteWords by viewModel.isSelectingNoteWords.collectAsState()
+        val selectedWordAnchors by viewModel.selectedWordAnchors.collectAsState()
+        val composingNote by viewModel.composingNote.collectAsState()
         val invertColors by viewModel.invertColors.collectAsState()
         val rotationDegrees by viewModel.rotationDegrees.collectAsState()
         val progressMode by viewModel.progressMode.collectAsState()
@@ -743,6 +913,11 @@ class PdfReaderScreen(
         val lookupEnabled by viewModel.lookupEnabled.collectAsState()
         val isLookingUp by viewModel.isLookingUp.collectAsState()
         val lookupResult by viewModel.lookupResult.collectAsState()
+        val keyboardOptionsFlow = rememberKeyboardOptions()
+
+        val savedNoteAnchors = remember(pageNotes) {
+            pageNotes.flatMap { WordNoteUtils.decodeAnchors(it.anchorsEncoded) }
+        }
 
         val density = LocalDensity.current
         val haptics = LocalHapticFeedback.current
@@ -1022,17 +1197,86 @@ class PdfReaderScreen(
             else -> String.format(Locale.US, "%.1fx", scale)
         }
 
-        val isOverlayOpen = isLookingUp || lookupResult != null
-        val hideChrome = isTextMode && isFullScreen && !isExtractingText
+        val isOverlayOpen = heldWord != null || isLookingUp || lookupResult != null
+        val hideChrome = isTextMode && isFullScreen && !isExtractingText && !isSelectingNoteWords
 
         LightTheme(colors = themeColors) {
+            val activeComposing = composingNote
+            if (activeComposing != null) {
+                val existingText = activeComposing.existingNote?.noteText.orEmpty()
+                val noteState = remember(activeComposing) {
+                    TextFieldState(
+                        initialText = existingText,
+                        initialSelection = TextRange(existingText.length),
+                    )
+                }
+                ReaderNoteComposer(
+                    title = "Page ${pageIndex + 1}",
+                    quotedExcerpt = activeComposing.quotedExcerpt,
+                    state = noteState,
+                    keyboardOptionsFlow = keyboardOptionsFlow,
+                    vibrator = vibrator,
+                    onSave = { viewModel.saveComposingNote(it) },
+                    onBack = { viewModel.dismissNoteComposer() },
+                    onDelete = if (activeComposing.existingNote != null) {
+                        { viewModel.deleteComposingNote() }
+                    } else {
+                        null
+                    },
+                    editorKey = activeComposing.existingNote?.id ?: activeComposing.quotedExcerpt,
+                )
+                return@LightTheme
+            }
+
             Box(
                 modifier = Modifier
                     .fillMaxSize()
                     .background(LightThemeTokens.colors.background),
             ) {
                 Column(modifier = Modifier.fillMaxSize()) {
-                    if (!hideChrome) {
+                    if (isSelectingNoteWords) {
+                        val selectedCount = selectedWordAnchors.size
+                        LightTopBar(
+                            leftButton = LightBarButton.Text(
+                                text = "Cancel",
+                                onClick = { viewModel.cancelNoteWordSelection() },
+                            ),
+                            center = LightTopBarCenter.Text(
+                                text = if (selectedCount > 0) "Where? ($selectedCount)" else "Where?",
+                            ),
+                            rightButton = LightBarButton.Text(
+                                text = "Done",
+                                onClick = {
+                                    if (selectedWordAnchors.isNotEmpty()) {
+                                        viewModel.finishNoteWordSelection()
+                                    }
+                                },
+                            ),
+                            modifier = Modifier.padding(bottom = 0.25f.gridUnitsAsDp()),
+                        )
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = horizontalPadDp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            LightText(
+                                text = if (selectedCount > 0) {
+                                    "Tap words to underline or remove, then tap Done"
+                                } else {
+                                    "Tap at least one word to underline"
+                                },
+                                variant = LightTextVariant.Detail,
+                                lighten = true,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                        HorizontalDivider(
+                            color = LightThemeTokens.colors.content.copy(alpha = 0.2f),
+                            thickness = 1.dp,
+                        )
+                    } else if (!hideChrome) {
                         LightTopBar(
                             leftButton = LightBarButton.LightIcon(
                                 icon = LightIcons.BACK,
@@ -1317,13 +1561,13 @@ class PdfReaderScreen(
                                     .fillMaxWidth()
                                     .onSizeChanged { textViewportSize = it }
                                     .readerHorizontalSwipes(
-                                        enabled = !isOverlayOpen,
+                                        enabled = !isOverlayOpen && !isSelectingNoteWords,
                                         onEdgeSwipeBack = { goBack() },
                                         onSwipeRight = { turnPrevInTextMode() },
                                         onSwipeLeft = { turnNextInTextMode() },
                                     )
-                                    .pointerInput(isOverlayOpen) {
-                                        if (isOverlayOpen) return@pointerInput
+                                    .pointerInput(isOverlayOpen, isSelectingNoteWords) {
+                                        if (isOverlayOpen || isSelectingNoteWords) return@pointerInput
                                         detectTapGestures(
                                             onDoubleTap = {
                                                 viewModel.toggleFullScreen(liveActiveTextPermille)
@@ -1372,10 +1616,11 @@ class PdfReaderScreen(
                                             .fillMaxSize()
                                             .padding(
                                                 horizontal = horizontalPadDp,
-                                                vertical = if (isFullScreen) 12.dp else 6.dp,
+                                                vertical = if (isFullScreen && !isSelectingNoteWords) 12.dp else 6.dp,
                                             ),
                                     ) {
                                         currentSubPage?.slices?.forEach { slice ->
+                                            val fullBlockText = textPage.blocks.getOrNull(slice.sourceIndex)?.text ?: slice.text
                                             if (slice.isHeading) {
                                                 LightText(
                                                     text = slice.text,
@@ -1390,12 +1635,31 @@ class PdfReaderScreen(
                                             } else {
                                                 LookupableReaderText(
                                                     text = slice.text,
+                                                    paragraphIndex = slice.sourceIndex,
+                                                    sliceOffsetInParagraph = slice.charOffsetInBlock,
+                                                    savedAnchors = savedNoteAnchors,
+                                                    selectedAnchors = selectedWordAnchors,
+                                                    isSelectingWords = isSelectingNoteWords,
                                                     variant = textVariant,
                                                     lighten = false,
-                                                    lookupEnabled = lookupEnabled,
+                                                    onTapChar = { offset ->
+                                                        if (viewModel.toggleNoteWordAt(
+                                                                paragraphIndex = slice.sourceIndex,
+                                                                fullParagraphText = fullBlockText,
+                                                                charIndexInParagraph = slice.charOffsetInBlock + offset,
+                                                            )
+                                                        ) {
+                                                            runCatching { vibrator.click() }
+                                                        }
+                                                    },
                                                     onLongPressChar = { offset ->
                                                         haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                                                        viewModel.lookupWordAt(slice.text, offset)
+                                                        viewModel.onWordLongPressed(
+                                                            paragraphIndex = slice.sourceIndex,
+                                                            fullParagraphText = fullBlockText,
+                                                            charIndexInParagraph = slice.charOffsetInBlock + offset,
+                                                            scrollPermille = liveActiveTextPermille,
+                                                        )
                                                     },
                                                     onDoubleTap = {
                                                         viewModel.toggleFullScreen(liveActiveTextPermille)
@@ -1417,8 +1681,8 @@ class PdfReaderScreen(
                                             .fillMaxSize()
                                             .padding(
                                                 start = horizontalPadDp,
-                                                top = if (isFullScreen) 10.dp else 0.dp,
-                                                bottom = if (isFullScreen) 10.dp else 0.dp,
+                                                top = if (isFullScreen && !isSelectingNoteWords) 10.dp else 0.dp,
+                                                bottom = if (isFullScreen && !isSelectingNoteWords) 10.dp else 0.dp,
                                             ),
                                     ) {
                                         Spacer(modifier = Modifier.height(10.dp))
@@ -1438,12 +1702,31 @@ class PdfReaderScreen(
                                             } else {
                                                 LookupableReaderText(
                                                     text = block.text,
+                                                    paragraphIndex = idx,
+                                                    sliceOffsetInParagraph = 0,
+                                                    savedAnchors = savedNoteAnchors,
+                                                    selectedAnchors = selectedWordAnchors,
+                                                    isSelectingWords = isSelectingNoteWords,
                                                     variant = textVariant,
                                                     lighten = false,
-                                                    lookupEnabled = lookupEnabled,
+                                                    onTapChar = { offset ->
+                                                        if (viewModel.toggleNoteWordAt(
+                                                                paragraphIndex = idx,
+                                                                fullParagraphText = block.text,
+                                                                charIndexInParagraph = offset,
+                                                            )
+                                                        ) {
+                                                            runCatching { vibrator.click() }
+                                                        }
+                                                    },
                                                     onLongPressChar = { offset ->
                                                         haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                                                        viewModel.lookupWordAt(block.text, offset)
+                                                        viewModel.onWordLongPressed(
+                                                            paragraphIndex = idx,
+                                                            fullParagraphText = block.text,
+                                                            charIndexInParagraph = offset,
+                                                            scrollPermille = liveActiveTextPermille,
+                                                        )
                                                     },
                                                     onDoubleTap = {
                                                         viewModel.toggleFullScreen(liveActiveTextPermille)
@@ -1734,7 +2017,7 @@ class PdfReaderScreen(
                     }
                 }
 
-                // Press-and-Hold Dictionary Overlay Card (active in PDF Text Mode)
+                // Press-and-Hold Dictionary + Add Note Overlay Card (active in PDF Text Mode)
                 if (isOverlayOpen) {
                     Box(
                         modifier = Modifier
@@ -1745,8 +2028,12 @@ class PdfReaderScreen(
                             },
                     ) {
                         DictionaryOverlayCard(
+                            heldWord = heldWord,
+                            lookupEnabled = lookupEnabled,
                             isLookingUp = isLookingUp,
                             result = lookupResult,
+                            onAddNote = { viewModel.startNoteWordSelection() },
+                            onEditNote = { note -> viewModel.openExistingNoteEditor(note) },
                             onDismiss = { viewModel.dismissLookup() },
                             modifier = Modifier
                                 .align(Alignment.BottomCenter)

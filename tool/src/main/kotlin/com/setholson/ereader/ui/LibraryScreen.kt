@@ -65,12 +65,16 @@ class LibraryViewModel(
     private val _bookmarkCount = MutableStateFlow(0)
     val bookmarkCount: StateFlow<Int> = _bookmarkCount.asStateFlow()
 
+    private val _noteCount = MutableStateFlow(0)
+    val noteCount: StateFlow<Int> = _noteCount.asStateFlow()
+
     private val _isScanning = MutableStateFlow(false)
     val isScanning: StateFlow<Boolean> = _isScanning.asStateFlow()
 
     private val manualRefreshTrigger = MutableStateFlow(0L)
     private var scanJob: Job? = null
     private var bookmarkJob: Job? = null
+    private var noteJob: Job? = null
 
     override fun onScreenShow(screen: SimpleLightScreen<Unit>) {
         super.onScreenShow(screen)
@@ -79,6 +83,13 @@ class LibraryViewModel(
         bookmarkJob = viewModelScope.launch {
             repository.bookmarkCount.collect { count ->
                 _bookmarkCount.value = count
+            }
+        }
+
+        noteJob?.cancel()
+        noteJob = viewModelScope.launch {
+            repository.noteCount.collect { count ->
+                _noteCount.value = count
             }
         }
 
@@ -120,7 +131,10 @@ class LibraryScreen(
                 ReaderDatabase::class.java,
                 ReaderRepository.DATABASE_NAME,
             ) {
-                addMigrations(ReaderDatabase.MIGRATION_2_3)
+                addMigrations(
+                    ReaderDatabase.MIGRATION_2_3,
+                    ReaderDatabase.MIGRATION_3_4,
+                )
                 fallbackToDestructiveMigration(true)
             }
         },
@@ -166,6 +180,7 @@ class LibraryScreen(
         val books by viewModel.books.collectAsState()
         val continueBook by viewModel.continueBook.collectAsState()
         val bookmarkCount by viewModel.bookmarkCount.collectAsState()
+        val noteCount by viewModel.noteCount.collectAsState()
         val isScanning by viewModel.isScanning.collectAsState()
 
         val userBooks = books.filter { !it.isBuiltIn }
@@ -269,7 +284,7 @@ class LibraryScreen(
                             )
                         }
 
-                        // 3. Bookmarks Quick Entry
+                        // 3. Bookmarks & Notes Quick Entry
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -283,11 +298,13 @@ class LibraryScreen(
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
                                 LightText(
-                                    text = "Bookmarks",
+                                    text = "Bookmarks & Notes",
                                     variant = LightTextVariant.Subheading,
                                 )
+                                val bmLabel = if (bookmarkCount == 1) "1 bookmark" else "$bookmarkCount bookmarks"
+                                val noteLabel = if (noteCount == 1) "1 note" else "$noteCount notes"
                                 LightText(
-                                    text = if (bookmarkCount == 1) "1 saved bookmark" else "$bookmarkCount saved bookmarks",
+                                    text = "$noteLabel • $bmLabel",
                                     variant = LightTextVariant.Detail,
                                     lighten = true,
                                     modifier = Modifier.padding(top = 2.dp),
